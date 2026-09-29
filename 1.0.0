@@ -1,0 +1,7 @@
+Defaulting to user installation because normal site-packages is not writeable
+Requirement already satisfied: httpcore in c:\users\azad\appdata\roaming\python\python314\site-packages (0.17.3)
+Requirement already satisfied: h11<0.15,>=0.13 in c:\users\azad\appdata\roaming\python\python314\site-packages (from httpcore) (0.14.0)
+Requirement already satisfied: sniffio==1.* in c:\users\azad\appdata\roaming\python\python314\site-packages (from httpcore) (1.3.1)
+Requirement already satisfied: anyio<5.0,>=3.0 in c:\users\azad\appdata\roaming\python\python314\site-packages (from httpcore) (3.7.1)
+Requirement already satisfied: certifi in c:\users\azad\appdata\roaming\python\python314\site-packages (from httpcore) (2026.2.25)
+Requirement already satisfied: idna>=2.8 in c:\users\azad\appdata\roaming\python\python314\site-packages (from anyio<5.0,>=3.0->httpcore) (3.11)

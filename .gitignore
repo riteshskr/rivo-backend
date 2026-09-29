@@ -1,0 +1,89 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+ENV/
+face_env/
+.venv/
+.env/
+venv*/
+ENV*/
+
+# Environment variables - सबसे जरूरी
+.env
+.env.local
+.env.development
+.env.production
+*.env
+
+# Flask / FastAPI / uploads
+instance/
+uploads/
+static/uploads/
+media/
+
+# Logs
+*.log
+logs/
+*.out
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Project specific folders
+chrome_whatsapp_data/
+driver_gps_app/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+.pytest_cache/
+.tox/
+.nox/
+
+# Firebase / Service Keys - बहुत जरूरी
+serviceAccountKey.json
+*serviceAccount*.json
+firebase-adminsdk*.json
+*-key.json
+credentials.json
+secrets/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# Dependency
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Build
+build/
+dist/
+*.egg-info/
+*.egg

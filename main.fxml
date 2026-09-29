@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+<?import javafx.scene.web.WebView?>
+
+<VBox spacing="10" xmlns:fx="http://javafx.com/fxml" fx:controller="MainController">
+    <TabPane>
+        <Tab text="यूजर">
+            <VBox spacing="10">
+                <TextField fx:id="addressField" promptText="सीकर में जगह खोजें" />
+                <WebView fx:id="mapView" prefHeight="300" />
+                <Label fx:id="distanceLabel" text="दूरी: 0 किमी" />
+                <Label fx:id="fareLabel" text="किराया: ₹0" />
+                <Button text="बुक करें" onAction="#handleBook" />
+            </VBox>
+        </Tab>
+        <Tab text="ड्राइवर">
+            <VBox spacing="10">
+                <TextField fx:id="driverPhone" promptText="फोन" />
+                <PasswordField fx:id="driverPassword" promptText="पासवर्ड" />
+                <Button text="लॉगिन" onAction="#handleDriverLogin" />
+                <VBox fx:id="driverPanel" visible="false">
+                    <Label fx:id="driverName" />
+                    <Button text="लॉगआउट" onAction="#handleDriverLogout" />
+                </VBox>
+            </VBox>
+        </Tab>
+    </TabPane>
+</VBox>

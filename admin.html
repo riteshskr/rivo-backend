@@ -1,0 +1,31 @@
+<h2>All Taxi Bookings</h2>
+
+<table border="1">
+
+<tr>
+<th>ID</th>
+<th>Name</th>
+<th>Phone</th>
+<th>Pickup</th>
+<th>Drop</th>
+<th>Fare</th>
+<th>Status</th>
+</tr>
+
+{% for b in bookings %}
+
+<tr>
+
+<td>{{b.id}}</td>
+<td>{{b.user_name}}</td>
+<td>{{b.phone}}</td>
+<td>{{b.pickup_location}}</td>
+<td>{{b.drop_location}}</td>
+<td>{{b.fare}}</td>
+<td>{{b.status}}</td>
+
+</tr>
+
+{% endfor %}
+
+</table>

@@ -1,0 +1,32 @@
+name: rivo_taxi_dubai
+description: Rivo Taxi Dubai - AED, 3 Languages, Parcel + Ride
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  google_maps_flutter: ^2.6.0
+  geolocator: ^10.1.0
+  flutter_dotenv: ^5.1.0
+  http: ^1.2.0
+  flutter_spinkit: ^5.2.0
+  intl: ^0.19.0
+  shared_preferences: ^2.2.2
+  uuid: ^4.3.3
+  url_launcher: ^6.2.2
+  web_socket_channel: ^2.4.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - .env
+    - assets/icons/
