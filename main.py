@@ -118,19 +118,32 @@ async def init_user(req: InitReq):
 async def get_vehicles(city: Optional[str] = Query(None)):
     try:
         if not supabase:
-            raise HTTPException(status_code=500, detail="Supabase client not initialized - check ENV")
+            return {
+                "error": "Supabase client is None",
+                "SUPABASE_URL": SUPABASE_URL,
+                "KEY_EXISTS": bool(SUPABASE_KEY),
+                "KEY_FIRST_10": SUPABASE_KEY[:10] if SUPABASE_KEY else "EMPTY"
+            }
 
         query = supabase.table("vehicles").select("*").order("id")
         if city:
             query = query.ilike("city", f"%{city}%")
 
         result = query.execute()
-        logger.info(f"VEHICLES FETCHED: {len(result.data)} rows")
-        return result.data
+        return {"count": len(result.data), "data": result.data}
 
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Supabase Error: {str(e)}")
+        import traceback
+        err_trace = traceback.format_exc()
+        print(err_trace)
+        return {
+            "error": "CRASHED",
+            "exception_type": str(type(e)),
+            "exception_str": str(e),
+            "traceback": err_trace,
+            "SUPABASE_URL": SUPABASE_URL,
+            "KEY_EXISTS": bool(SUPABASE_KEY)
+        }
 
 @app.post("/rides")
 async def create_ride(payload: RideCreate, user_id: str = Query(...)):
