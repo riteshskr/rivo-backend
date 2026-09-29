@@ -1,6 +1,5 @@
 import os
 import json
-import asyncio
 from datetime import datetime
 from typing import Optional, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
@@ -11,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="Rivo Taxi API - Temp User System")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,13 +20,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Supabase Client - SERVICE ROLE KEY USE KARO ---
+# --- Supabase Client ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") # yahi service_role key hai
-# Agar aapke paas SUPABASE_SERVICE_ROLE_KEY naam se hai to vo use karo
-if not SUPABASE_KEY:
-    SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- WebSocket Manager ---
@@ -43,11 +38,12 @@ class ConnectionManager:
 
     def disconnect(self, ride_id: int, websocket: WebSocket):
         if ride_id in self.active_connections:
-            self.active_connections[ride_id].remove(websocket)
+            if websocket in self.active_connections[ride_id]:
+                self.active_connections[ride_id].remove(websocket)
 
     async def broadcast(self, ride_id: int, message: dict):
         if ride_id in self.active_connections:
-            for connection in self.active_connections[ride_id]:
+            for connection in list(self.active_connections[ride_id]):
                 try:
                     await connection.send_text(json.dumps(message))
                 except:
@@ -73,61 +69,54 @@ class RideCreateRequest(BaseModel):
     trip_type: str = "ride"
     otp: str
 
-# --- 1. Vehicles ---
+# --- 1. Vehicles API ---
 @app.get("/vehicles")
 def get_vehicles():
     try:
         res = supabase.table("vehicles").select("*").execute()
-        return res.data
+        if res.data:
+            return res.data
     except Exception as e:
-        # Agar vehicles table nahi hai to default return karo
-        return [
-            {"id": 1, "name": "Mini", "fare_per_km": 12, "night_fare_per_km": 15, "min_fare": 50, "parcel_per_km": 15, "parcel_night_per_km": 18, "parcel_min_fare": 60, "icon_path": "assets/icons/car.png"},
-            {"id": 2, "name": "Sedan", "fare_per_km": 15, "night_fare_per_km": 18, "min_fare": 80, "parcel_per_km": 18, "parcel_night_per_km": 20, "parcel_min_fare": 80, "icon_path": "assets/icons/sedan.png"},
-            {"id": 3, "name": "Auto", "fare_per_km": 10, "night_fare_per_km": 12, "min_fare": 40, "parcel_per_km": 12, "parcel_night_per_km": 15, "parcel_min_fare": 50, "icon_path": "assets/icons/auto.png"},
-        ]
+        print(f"Vehicles error: {e}")
 
-# --- 2. User Init - Yahi aapka main fix hai ---
+    return [
+        {"id": 1, "name": "Mini", "fare_per_km": 12, "night_fare_per_km": 15, "min_fare": 50, "parcel_per_km": 15, "parcel_night_per_km": 18, "parcel_min_fare": 60, "icon_path": "assets/icons/car.png"},
+        {"id": 2, "name": "Sedan", "fare_per_km": 15, "night_fare_per_km": 18, "min_fare": 80, "parcel_per_km": 18, "parcel_night_per_km": 20, "parcel_min_fare": 80, "icon_path": "assets/icons/sedan.png"},
+        {"id": 3, "name": "Auto", "fare_per_km": 10, "night_fare_per_km": 12, "min_fare": 40, "parcel_per_km": 12, "parcel_night_per_km": 15, "parcel_min_fare": 50, "icon_path": "assets/icons/auto.png"},
+    ]
+
+# --- 2. User Init - Har baar Temp User ---
 @app.post("/users/init")
 def init_user(payload: UserInitRequest):
     device_id = payload.device_id
-    print(f"Init request for device_id: {device_id}")
-
+    print(f"Init temp user: {device_id}")
     try:
-        # Pehle check karo user hai kya
-        existing = supabase.table("users").select("*").eq("id", device_id).execute()
-        if existing.data and len(existing.data) > 0:
-            # last_active update karo
-            supabase.table("users").update({"last_active": datetime.now().isoformat()}).eq("id", device_id).execute()
-            return existing.data[0]
+        # Purana user hai to delete karke naya banao - taaki temp rahe
+        supabase.table("users").delete().eq("id", device_id).execute()
 
-        # Nahi hai to naya banao
-        new_user_data = {
+        new_user = {
             "id": device_id,
             "device_id": device_id,
             "created_at": datetime.now().isoformat(),
             "last_active": datetime.now().isoformat()
         }
-        res = supabase.table("users").insert(new_user_data).execute()
-        print(f"User created: {res.data}")
+        res = supabase.table("users").insert(new_user).execute()
         return res.data[0]
     except Exception as e:
         print(f"User init error: {e}")
-        raise e
+        # Agar error bhi aaye to bhi id return kar do taaki ride rukey nahi
+        return {"id": device_id, "device_id": device_id}
 
 # --- 3. Create Ride ---
 @app.post("/rides")
 def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
-    print(f"Creating ride for user_id: {user_id}")
+    print(f"Creating ride for temp user: {user_id}")
     try:
-        # 1. Pehle pakka karo user exist karta hai
-        user_check = supabase.table("users").select("id").eq("id", user_id).execute()
-        if not user_check.data:
-            # Agar user nahi hai to bana do
+        # User exist karta hai ya nahi check karo, nahi to banao
+        check = supabase.table("users").select("id").eq("id", user_id).execute()
+        if not check.data:
             supabase.table("users").insert({"id": user_id, "device_id": user_id}).execute()
-            print(f"Auto-created missing user: {user_id}")
 
-        # 2. Ride data banao
         ride_data = {
             "user_id": user_id,
             "pickup_lat": payload.pickup_lat,
@@ -149,7 +138,6 @@ def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
             ride_data["scheduled_time"] = payload.scheduled_time
 
         res = supabase.table("rides").insert(ride_data).execute()
-        print(f"Ride created: {res.data[0]['id']}")
         return res.data[0]
     except Exception as e:
         print(f"Ride create error: {e}")
@@ -171,24 +159,53 @@ def get_ongoing_ride(user_id: str):
         return None
     return res.data[0]
 
-# --- 6. Cancel Ride ---
+# --- 6. Cancel Ride - Ride Keep, User Delete ---
 @app.put("/rides/{ride_id}/cancel")
 def cancel_ride(ride_id: int, user_id: str = Query(...)):
-    res = supabase.table("rides").update({"status": "cancelled"}).eq("id", ride_id).execute()
-    return {"success": True, "data": res.data}
+    try:
+        # Ride ko sirf cancelled mark karo, delete mat karo
+        supabase.table("rides").update({"status": "cancelled"}).eq("id", ride_id).execute()
+        # Sirf user delete karo
+        supabase.table("users").delete().eq("id", user_id).execute()
+        print(f"Cancelled: Ride kept {ride_id}, User deleted {user_id}")
+        return {"success": True}
+    except Exception as e:
+        print(f"Cancel error: {e}")
+        return {"success": False, "error": str(e)}
 
-# --- 7. WebSocket for Live Tracking ---
+# --- 7. Complete Ride - Ride Keep, User Delete ---
+@app.put("/rides/{ride_id}/complete")
+def complete_ride(ride_id: int):
+    try:
+        ride_res = supabase.table("rides").select("user_id").eq("id", ride_id).execute()
+        if ride_res.data:
+            user_id = ride_res.data[0]['user_id']
+            # Ride ko completed mark karo
+            supabase.table("rides").update({"status": "completed"}).eq("id", ride_id).execute()
+            # User delete karo taaki users table halki rahe
+            supabase.table("users").delete().eq("id", user_id).execute()
+            print(f"Completed: Ride kept {ride_id}, User deleted {user_id}")
+        return {"success": True}
+    except Exception as e:
+        print(f"Complete error: {e}")
+        return {"success": False, "error": str(e)}
+
+# --- 8. WebSocket ---
 @app.websocket("/ws/ride/{ride_id}")
 async def websocket_endpoint(websocket: WebSocket, ride_id: int):
     await manager.connect(ride_id, websocket)
     try:
         while True:
             data = await websocket.receive_text()
-            # Driver se location aayegi to sabko broadcast karo
             try:
                 msg = json.loads(data)
                 await manager.broadcast(ride_id, msg)
             except:
-                await manager.broadcast(ride_id, {"type": "driver_location", "raw": data})
+                await manager.broadcast(ride_id, {"type": "message", "data": data})
     except WebSocketDisconnect:
         manager.disconnect(ride_id, websocket)
+
+@app.get("/")
+def root():
+    return {"status": "Rivo API Running - Temp User Mode - Rides Kept, Users Deleted"}
+
