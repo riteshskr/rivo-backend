@@ -26,7 +26,7 @@ app.add_middleware(
 )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
@@ -94,160 +94,222 @@ class DriverLoginRequest(BaseModel):
     phone: Optional[str] = None
     password: str
     fcm_token: Optional[str] = None
+    current_latitude: Optional[float] = None
+    current_longitude: Optional[float] = None
 class TokenRequest(BaseModel):
     driver_id: str
     ride_id: Optional[str] = None
 
 def generate_stringee_token(user_id: str, ride_id: str = ""):
     if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET:
+        print("STRINGEE Keys missing")
         return None, None
     try:
         clean_id = user_id.replace("+", "").replace(" ", "_").replace("-", "_").strip()
         now = int(time.time())
-        unique_jti = f"{STRINGEE_API_KEY_SID}-{now}-{clean_id}-{ride_id}-{uuid.uuid4().hex[:6]}"
+        unique_jti = f"{STRINGEE_API_KEY_SID}-{now}-{clean_id}-{ride_id}-{uuid.uuid4().hex[:8]}"
         payload = {"jti": unique_jti, "iss": STRINGEE_API_KEY_SID, "exp": now + 3600, "userId": clean_id}
         token = jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256")
         print(f"NEW TOKEN for {clean_id} Ride {ride_id}")
         return token, clean_id
     except Exception as e:
-        print(f"Token Error {e}")
+        print(f"Token error: {e}")
         return None, None
 
-# --- 1. LOGIN PAR TOKEN NAHI BANEGA ---
+def send_fcm_to_drivers(ride_data: dict):
+    try:
+        vehicle_type = ride_data.get("vehicle_type", "Bike")
+        res = supabase.table("drivers").select("fcm_token").eq("is_online", True).eq("available", True).eq("vehicle_type", vehicle_type).execute()
+        tokens = [d['fcm_token'] for d in res.data if d.get('fcm_token') and not d['fcm_token'].startswith('backend_gen_')]
+        if not tokens: return
+        message = messaging.MulticastMessage(
+            notification=messaging.Notification(title=f"New {vehicle_type} Ride - {ride_data['fare']}", body=f"{ride_data.get('pickup_address','')}"),
+            data={"type": "new_ride_alert", "ride_id": str(ride_data['id'])},
+            tokens=tokens,
+            android=messaging.AndroidConfig(priority="high")
+        )
+        messaging.send_each_for_multicast(message)
+    except Exception as e:
+        print(f"FCM Error: {e}")
+
+@app.get("/stringee/token")
+def get_stringee_token(user_id: str = Query(...), ride_id: str = Query("")):
+    token, clean_id = generate_stringee_token(user_id, ride_id)
+    if not token: raise HTTPException(status_code=500, detail="Token fail")
+    return {"token": token, "access_token": token, "userId": clean_id}
+
+@app.post("/stringee/token/generate")
+def generate_token_post(payload: TokenRequest):
+    token, clean_id = generate_stringee_token(payload.driver_id, payload.ride_id or "")
+    if not token: raise HTTPException(status_code=500, detail="Keys missing")
+    return {"access_token": token, "token": token, "userId": clean_id}
+
+@app.get("/vehicles")
+def get_vehicles():
+    res = supabase.table("vehicles").select("*").order("id").execute()
+    return res.data or []
+
+@app.post("/users/init")
+def init_user(payload: UserInitRequest):
+    try:
+        supabase.table("users").delete().eq("id", payload.device_id).execute()
+        new_user = {"id": payload.device_id, "device_id": payload.device_id, "created_at": datetime.now().isoformat()}
+        res = supabase.table("users").insert(new_user).execute()
+        return res.data[0]
+    except:
+        return {"id": payload.device_id}
+
+# --- LOGIN PAR TOKEN NAHI BANEGA ---
 @app.post("/drivers/login")
 def driver_login(payload: DriverLoginRequest):
     q = supabase.table("drivers").select("*")
     if payload.driver_id: q = q.eq("id", payload.driver_id)
     elif payload.phone: q = q.eq("phone", payload.phone)
     else: raise HTTPException(status_code=400, detail="driver_id bhejo")
-
     res = q.execute()
-    if not res.data: raise HTTPException(status_code=404, detail="Driver not found")
+    if not res.data: raise HTTPException(status_code=404, detail="Driver nahi mila")
     driver = res.data[0]
     if driver.get("password")!= payload.password:
         raise HTTPException(status_code=401, detail="Password galat")
 
-    fcm = payload.fcm_token or driver.get("fcm_token") or f"backend_gen_{uuid.uuid4().hex[:8]}"
+    final_fcm = payload.fcm_token or driver.get("fcm_token") or f"backend_gen_{uuid.uuid4().hex[:8]}"
 
-    # YAHAN TOKEN GENERATE NAHI KAR RAHE - SIRF ONLINE STATUS
+    # Sirf online status update, token nahi
     supabase.table("drivers").update({
         "is_online": True,
         "available": True,
-        "fcm_token": fcm,
+        "fcm_token": final_fcm,
         "last_seen": datetime.now().isoformat()
     }).eq("id", driver["id"]).execute()
 
     driver_data = supabase.table("drivers").select("*").eq("id", driver["id"]).execute().data[0]
-    return {"success": True, "driver": driver_data} # token nahi bhej rahe
+    return {"success": True, "driver": driver_data}
 
-@app.get("/stringee/token")
-def get_token(user_id: str = Query(...), ride_id: str = Query("")):
-    token, clean_id = generate_stringee_token(user_id, ride_id)
-    if not token: raise HTTPException(status_code=500, detail="Keys missing")
-    return {"token": token, "access_token": token, "userId": clean_id}
+@app.post("/drivers/logout")
+def driver_logout(driver_id: str = Query(...)):
+    supabase.table("drivers").update({"is_online": False, "available": False}).eq("id", driver_id).execute()
+    return {"success": True}
 
-# --- 2. ACCEPT PAR HI TOKEN BANEGA AUR RIDE TABLE ME SAVE HOGA ---
+# --- ACCEPT PAR HI TOKEN BANEGA AUR RIDE TABLE ME SAVE HOGA ---
 @app.put("/rides/{ride_id}/accept")
 def accept_ride(ride_id: int, driver_id: str = Query(...)):
     try:
-        d_res = supabase.table("drivers").select("id, name, phone").eq("id", driver_id).execute()
-        if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
-        driver = d_res.data[0]
+        driver_res = supabase.table("drivers").select("id, name, phone, vehicle_number").eq("id", driver_id).execute()
+        if not driver_res.data: raise HTTPException(status_code=404, detail="Driver not found")
+        driver = driver_res.data[0]
 
-        # HAR RIDE PAR NAYA TOKEN - SIRF YAHAN
-        new_token, clean_driver_id = generate_stringee_token(driver_id, str(ride_id))
+        # Har ride par naya token
+        new_token, clean_id = generate_stringee_token(driver_id, str(ride_id))
         if not new_token:
-            raise HTTPException(status_code=500, detail="STRINGEE keys missing in env")
+            raise HTTPException(status_code=500, detail="STRINGEE_API_KEY_SID/SECRET missing in env")
 
-        # Ride table me hi save karo
+        # Ride table me update - aapke existing column me
         ride_update = {
             "driver_id": driver["id"],
             "status": "accepted",
             "driver_name": driver.get("name"),
             "driver_phone": driver.get("phone"),
             "driver_stringee_token": new_token,
-            "driver_stringee_user_id": clean_driver_id,
-            "driver_driver_tocken": new_token, # aapke purane column ke liye
+            "driver_stringee_user_id": clean_id,
             "accepted_at": datetime.now().isoformat()
         }
 
         supabase.table("rides").update(ride_update).eq("id", ride_id).eq("status", "pending").execute()
 
-        # Driver table me bhi token update kar do taki call ke liye mile (optional)
-        try:
-            supabase.table("drivers").update({
-                "stringee_token": new_token,
-                "stringee_user_id": clean_driver_id
-            }).eq("id", driver_id).execute()
-        except: pass
+        updated_ride_res = supabase.table("rides").select("*").eq("id", ride_id).execute()
+        if not updated_ride_res.data: raise HTTPException(status_code=404, detail="Ride not found")
+        updated_ride = updated_ride_res.data[0]
 
-        ride_res = supabase.table("rides").select("*").eq("id", ride_id).execute()
-        if not ride_res.data: raise HTTPException(status_code=404, detail="Ride not found after accept")
-
-        print(f"Ride {ride_id} Accepted - Token saved in RIDE table only")
+        print(f"Ride {ride_id} Accepted -> Token saved in driver_stringee_token")
 
         return {
             "success": True,
-            "ride": ride_res.data[0],
+            "ride": updated_ride,
             "stringee_token": new_token,
-            "stringee_user_id": clean_driver_id
+            "stringee_user_id": clean_id
         }
     except HTTPException as he:
         raise he
     except Exception as e:
         import traceback
         traceback.print_exc()
+        print(f"Accept error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# --- Baaki APIs same ---
-@app.post("/users/init")
-def init_user(payload: UserInitRequest):
-    try:
-        supabase.table("users").delete().eq("id", payload.device_id).execute()
-        res = supabase.table("users").insert({"id": payload.device_id, "device_id": payload.device_id}).execute()
-        return res.data[0]
-    except:
-        return {"id": payload.device_id}
 
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
+    check = supabase.table("users").select("id").eq("id", user_id).execute()
+    if not check.data:
+        supabase.table("users").insert({"id": user_id, "device_id": user_id}).execute()
     token, clean_id = generate_stringee_token(user_id)
     ride_data = {
-        "user_id": user_id,
-        "pickup_lat": payload.pickup_lat, "pickup_lng": payload.pickup_lng,
+        "user_id": user_id, "pickup_lat": payload.pickup_lat, "pickup_lng": payload.pickup_lng,
         "drop_lat": payload.drop_lat, "drop_lng": payload.drop_lng,
         "pickup_address": payload.pickup_address, "drop_address": payload.drop_address,
         "vehicle_type": payload.vehicle_type, "distance": payload.distance, "fare": payload.fare,
-        "status": "pending", "otp": payload.otp, "city": "Sikar",
-        "created_at": datetime.now().isoformat(),
-        "stringee_token": token, "stringee_user_id": clean_id
+        "status": "pending", "otp": payload.otp, "trip_type": payload.trip_type, "city": "Sikar",
+        "created_at": datetime.now().isoformat(), "stringee_token": token, "stringee_user_id": clean_id
     }
     if payload.scheduled_time: ride_data["scheduled_time"] = payload.scheduled_time
     res = supabase.table("rides").insert(ride_data).execute()
     new_ride = res.data[0]
     await manager.broadcast_new_ride(new_ride)
+    send_fcm_to_drivers(new_ride)
     return new_ride
 
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
-    return res.data[0] if res.data else {"error": "not found"}
+    if not res.data: return {"error": "Ride not found"}
+    return res.data[0]
+
+@app.get("/rides/ongoing/{user_id}")
+def get_ongoing_ride(user_id: str):
+    res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending", "accepted", "started"]).order("created_at", desc=True).limit(1).execute()
+    return res.data[0] if res.data else None
 
 @app.get("/rides/pending/list")
-def pending_list(vehicle_type: Optional[str] = None):
+def get_pending_rides(vehicle_type: Optional[str] = None):
     q = supabase.table("rides").select("*").eq("status", "pending").order("created_at", desc=True)
     if vehicle_type: q = q.eq("vehicle_type", vehicle_type)
-    return q.execute().data or []
+    res = q.execute()
+    return res.data or []
+
+@app.put("/rides/{ride_id}/cancel")
+def cancel_ride(ride_id: int, user_id: str = Query(...)):
+    supabase.table("rides").update({"status": "cancelled"}).eq("id", ride_id).execute()
+    supabase.table("users").delete().eq("id", user_id).execute()
+    return {"success": True}
 
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int):
-    r = supabase.table("rides").select("user_id").eq("id", ride_id).execute()
-    if r.data:
+    ride_res = supabase.table("rides").select("user_id").eq("id", ride_id).execute()
+    if ride_res.data:
         supabase.table("rides").update({"status": "completed", "completed_at": datetime.now().isoformat()}).eq("id", ride_id).execute()
-        supabase.table("users").delete().eq("id", r.data[0]['user_id']).execute()
+        supabase.table("users").delete().eq("id", ride_res.data[0]['user_id']).execute()
     return {"success": True}
+
+@app.websocket("/ws/ride/{ride_id}")
+async def ride_ws(websocket: WebSocket, ride_id: int):
+    await manager.connect(ride_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try: await manager.broadcast(ride_id, json.loads(data))
+            except: await manager.broadcast(ride_id, {"type": "message", "data": data})
+    except WebSocketDisconnect:
+        manager.disconnect(ride_id, websocket)
+
+@app.websocket("/ws/drivers")
+async def driver_ws(websocket: WebSocket, city: str = Query("Sikar")):
+    await manager.connect_driver(websocket)
+    try:
+        await websocket.send_text(json.dumps({"type": "connected", "city": city}))
+        while True: await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect_driver(websocket)
 
 @app.get("/")
 def root():
-    return {"status": "Token Only On Accept - Working"}
+    return {"status": "Final - Token Only On Accept in driver_stringee_token", "online": len(manager.driver_connections)}
 
