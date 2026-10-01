@@ -300,6 +300,16 @@ async def ws_ride(ws: WebSocket, ride_id: int):
             await manager.broadcast(ride_id, json.loads(data))
     except WebSocketDisconnect:
         manager.disconnect(ride_id, ws)
+@app.get("/drivers/{driver_id}/active-ride")
+def get_active_ride(driver_id: str):
+    try:
+        res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started"]).order("id", desc=True).limit(1).execute()
+        if res.data and len(res.data) > 0:
+            return {"active": True, "ride": res.data[0]}
+        return {"active": False, "ride": None}
+    except Exception as e:
+        print(f"Active Ride Error: {e}")
+        return {"active": False, "ride": None}
 
 @app.get("/")
 def root(): return {"status":"All Fixed - OTP Verify Added"}
