@@ -237,8 +237,7 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
         # OTP Sahi hai - status ko started kar do
         supabase.table("rides").update({
             "status": "started",
-            "otp_verified_at": datetime.now().isoformat(),
-            "started_at": datetime.now().isoformat()
+             "started_at": datetime.now().isoformat()
         }).eq("id", ride_id).execute()
 
         return {"success": True, "message": "OTP Verified, Ride Started"}
