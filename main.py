@@ -84,6 +84,10 @@ class DriverLoginRequest(BaseModel):
     driver_id: Optional[str]=None; phone: Optional[str]=None; password: str
     fcm_token: Optional[str]=None
 
+# ===== NEW MODEL FOR OTP VERIFY =====
+class OtpVerifyRequest(BaseModel):
+    otp: str
+
 def generate_stringee_token(user_id: str, ride_id: str=""):
     if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET:
         print("STRINGEE Keys Missing!")
@@ -119,7 +123,6 @@ def driver_login(p: DriverLoginRequest):
         if not login_id:
             raise HTTPException(status_code=400, detail="Driver ID भेजो")
 
-        # 3 जगह ट्राई करेगा - सबसे सेफ तरीका
         res = supabase.table("drivers").select("*").eq("driver_id", login_id).execute()
         if not res.data:
             res = supabase.table("drivers").select("*").eq("id", login_id).execute()
@@ -148,16 +151,20 @@ def driver_login(p: DriverLoginRequest):
         print(f"Login Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============ PENDING LIST FIX - FINAL ============
+# ============ PENDING LIST FIX - OTP HATAYA ============
 @app.get("/rides/pending/list")
 def pending_rides(vehicle_type: str = Query(None)):
     try:
         q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True)
-        # Case insensitive filter
         if vehicle_type and vehicle_type.strip()!= "":
             q = q.ilike("vehicle_type", f"%{vehicle_type.strip()}%")
         res = q.execute()
-        return res.data or []
+        data = res.data or []
+        # SECURITY FIX: Pending list me OTP mat bhejo
+        for ride in data:
+            ride.pop("otp", None)
+            ride.pop("stringee_token", None)
+        return data
     except Exception as e:
         print(f"Pending Error: {e}")
         return []
@@ -205,6 +212,43 @@ def accept_ride(ride_id: int, driver_id: str=Query(...)):
         raise HTTPException(status_code=404, detail="Ride already taken")
     return {"success":True,"ride":ride.data[0],"stringee_token":new_token,"stringee_user_id":clean_id}
 
+# ============ NEW API - OTP VERIFY ============
+@app.post("/rides/{ride_id}/verify-otp")
+def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
+    try:
+        res = supabase.table("rides").select("id,otp,status").eq("id", ride_id).execute()
+        if not res.data:
+            raise HTTPException(status_code=404, detail="Ride not found")
+
+        ride = res.data[0]
+        if ride["status"] not in ["accepted", "arrived"]:
+            # agar ride already started hai toh bhi ok
+            if ride["status"] == "started":
+                return {"success": True, "message": "Already verified"}
+
+        db_otp = str(ride.get("otp", "")).strip()
+        user_otp = str(payload.otp).strip()
+
+        print(f"Verify Ride {ride_id}: DB OTP={db_otp} vs User OTP={user_otp}")
+
+        if db_otp!= user_otp:
+            raise HTTPException(status_code=400, detail="Galat OTP")
+
+        # OTP Sahi hai - status ko started kar do
+        supabase.table("rides").update({
+            "status": "started",
+            "otp_verified_at": datetime.now().isoformat(),
+            "started_at": datetime.now().isoformat()
+        }).eq("id", ride_id).execute()
+
+        return {"success": True, "message": "OTP Verified, Ride Started"}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"OTP Verify Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     token, clean_id = generate_stringee_token(user_id)
@@ -219,7 +263,9 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     }
     res = supabase.table("rides").insert(ride_data).execute()
     new_ride=res.data[0]
-    await manager.broadcast_new_ride(new_ride)
+    # driver ko broadcast karte time OTP mat bhejo
+    broadcast_data = {k: v for k, v in new_ride.items() if k!= "otp"}
+    await manager.broadcast_new_ride(broadcast_data)
     return new_ride
 
 @app.get("/rides/{ride_id}")
@@ -229,7 +275,7 @@ def get_ride(ride_id: int):
 
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int):
-    supabase.table("rides").update({"status":"completed"}).eq("id",ride_id).execute()
+    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now().isoformat()}).eq("id",ride_id).execute()
     return {"success":True}
 
 @app.put("/rides/{ride_id}/cancel")
@@ -257,4 +303,5 @@ async def ws_ride(ws: WebSocket, ride_id: int):
         manager.disconnect(ride_id, ws)
 
 @app.get("/")
-def root(): return {"status":"All Fixed - Login + Pending + Vehicles"}
+def root(): return {"status":"All Fixed - OTP Verify Added"}
+
