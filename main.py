@@ -7,10 +7,10 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import firebase_admin
-from firebase_admin import credentials
+from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Taxi API - Full Final Fixed")
+app = FastAPI(title="Taxi API - FCM High Priority Fixed")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,14 +27,14 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
 
-# Firebase Init - Safe Version
+# Firebase Init
 try:
     fj = os.getenv("FIREBASE_CREDENTIALS_JSON")
     if fj and not firebase_admin._apps:
         cred_dict = json.loads(fj)
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
-        print("Firebase OK")
+        print("Firebase OK - FCM Ready")
 except Exception as e:
     print(f"Firebase Error (Ignored): {e}")
 
@@ -63,7 +63,7 @@ class ConnectionManager:
         if ws in self.driver_connections:
             self.driver_connections.remove(ws)
     async def broadcast_new_ride(self, ride_data: dict):
-        print(f"Broadcasting new ride to {len(self.driver_connections)} drivers")
+        print(f"Broadcasting new ride to {len(self.driver_connections)} drivers via WS")
         for ws in list(self.driver_connections):
             try:
                 await ws.send_text(json.dumps({"type":"new_ride_alert","data":ride_data}))
@@ -72,6 +72,61 @@ class ConnectionManager:
                 except: pass
 
 manager = ConnectionManager()
+
+# ===== FCM HIGH PRIORITY FUNCTION =====
+def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
+    try:
+        if not firebase_admin._apps:
+            print("Firebase not initialized, skipping FCM")
+            return
+
+        # सभी Online Drivers के Token निकालो
+        q = supabase.table("drivers").select("fcm_token,is_online").eq("is_online", True).neq("fcm_token", None).neq("fcm_token", "")
+        drivers = q.execute().data or []
+
+        tokens = [d['fcm_token'] for d in drivers if d.get('fcm_token')]
+        # Duplicate हटाओ
+        tokens = list(set(tokens))
+
+        if not tokens:
+            print("No FCM tokens found for drivers")
+            return
+
+        print(f"Sending FCM High Priority to {len(tokens)} drivers")
+
+        # High Priority Message with Custom Sound alert.mp3
+        message = messaging.MulticastMessage(
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    channel_id='ride_channel_v3',
+                    sound='alert',
+                    priority='high',
+                    visibility='public',
+                    default_vibrate_timings=False,
+                ),
+            ),
+            notification=messaging.Notification(
+                title='🔔 नई Ride आई है!',
+                body=f"{ride_data.get('pickup_address','New Ride')} -> {ride_data.get('drop_address','')} | ₹{ride_data.get('fare','')}"
+            ),
+            data={
+                'type': 'new_ride_alert',
+                'ride_id': str(ride_data.get('id','')),
+                'pickup': str(ride_data.get('pickup_address','')),
+                'fare': str(ride_data.get('fare','')),
+                'click_action': 'FLUTTER_NOTIFICATION_CLICK'
+            },
+            tokens=tokens
+        )
+        response = messaging.send_multicast(message)
+        print(f"FCM Sent: {response.success_count} success, {response.failure_count} fail")
+        if response.failure_count > 0:
+            for idx, resp in enumerate(response.responses):
+                if not resp.success:
+                    print(f"Failed token {tokens[idx][:20]}... Error: {resp.exception}")
+    except Exception as e:
+        print(f"FCM Error: {e}")
 
 class UserInitRequest(BaseModel): device_id: str
 class RideCreateRequest(BaseModel):
@@ -84,7 +139,6 @@ class DriverLoginRequest(BaseModel):
     driver_id: Optional[str]=None; phone: Optional[str]=None; password: str
     fcm_token: Optional[str]=None
 
-# ===== NEW MODEL FOR OTP VERIFY =====
 class OtpVerifyRequest(BaseModel):
     otp: str
 
@@ -115,7 +169,6 @@ def init_user(p: UserInitRequest):
         print(e)
         return {"id":p.device_id}
 
-# ============ LOGIN FIX - FINAL ============
 @app.post("/drivers/login")
 def driver_login(p: DriverLoginRequest):
     try:
@@ -151,7 +204,6 @@ def driver_login(p: DriverLoginRequest):
         print(f"Login Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ============ PENDING LIST FIX - OTP HATAYA ============
 @app.get("/rides/pending/list")
 def pending_rides(vehicle_type: str = Query(None)):
     try:
@@ -160,7 +212,6 @@ def pending_rides(vehicle_type: str = Query(None)):
             q = q.ilike("vehicle_type", f"%{vehicle_type.strip()}%")
         res = q.execute()
         data = res.data or []
-        # SECURITY FIX: Pending list me OTP mat bhejo
         for ride in data:
             ride.pop("otp", None)
             ride.pop("stringee_token", None)
@@ -212,36 +263,26 @@ def accept_ride(ride_id: int, driver_id: str=Query(...)):
         raise HTTPException(status_code=404, detail="Ride already taken")
     return {"success":True,"ride":ride.data[0],"stringee_token":new_token,"stringee_user_id":clean_id}
 
-# ============ NEW API - OTP VERIFY ============
 @app.post("/rides/{ride_id}/verify-otp")
 def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
     try:
         res = supabase.table("rides").select("id,otp,status").eq("id", ride_id).execute()
         if not res.data:
             raise HTTPException(status_code=404, detail="Ride not found")
-
         ride = res.data[0]
         if ride["status"] not in ["accepted", "arrived"]:
-            # agar ride already started hai toh bhi ok
             if ride["status"] == "started":
                 return {"success": True, "message": "Already verified"}
-
         db_otp = str(ride.get("otp", "")).strip()
         user_otp = str(payload.otp).strip()
-
         print(f"Verify Ride {ride_id}: DB OTP={db_otp} vs User OTP={user_otp}")
-
         if db_otp!= user_otp:
             raise HTTPException(status_code=400, detail="Galat OTP")
-
-        # OTP Sahi hai - status ko started kar do
         supabase.table("rides").update({
             "status": "started",
              "started_at": datetime.now().isoformat()
         }).eq("id", ride_id).execute()
-
         return {"success": True, "message": "OTP Verified, Ride Started"}
-
     except HTTPException as he:
         raise he
     except Exception as e:
@@ -262,9 +303,14 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     }
     res = supabase.table("rides").insert(ride_data).execute()
     new_ride=res.data[0]
-    # driver ko broadcast karte time OTP mat bhejo
+
+    # 1. WebSocket Broadcast (Foreground)
     broadcast_data = {k: v for k, v in new_ride.items() if k!= "otp"}
     await manager.broadcast_new_ride(broadcast_data)
+
+    # 2. FCM High Priority (Background + Kill)
+    send_fcm_high_priority_to_drivers(new_ride, payload.vehicle_type)
+
     return new_ride
 
 @app.get("/rides/{ride_id}")
@@ -300,6 +346,7 @@ async def ws_ride(ws: WebSocket, ride_id: int):
             await manager.broadcast(ride_id, json.loads(data))
     except WebSocketDisconnect:
         manager.disconnect(ride_id, ws)
+
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
     try:
@@ -312,5 +359,5 @@ def get_active_ride(driver_id: str):
         return {"active": False, "ride": None}
 
 @app.get("/")
-def root(): return {"status":"All Fixed - OTP Verify Added"}
+def root(): return {"status":"FCM High Priority Fixed - Background Alert Working"}
 
