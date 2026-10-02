@@ -41,35 +41,50 @@ except Exception as e:
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[int, list[WebSocket]] = {}
-        self.driver_connections: list[WebSocket] = []
+        self.driver_connections: list[dict] = [] # अब dict रखेंगे
+
     async def connect(self, ride_id: int, ws: WebSocket):
         await ws.accept()
         if ride_id not in self.active_connections:
             self.active_connections[ride_id]=[]
         self.active_connections[ride_id].append(ws)
+
     def disconnect(self, ride_id: int, ws: WebSocket):
         if ride_id in self.active_connections and ws in self.active_connections[ride_id]:
             self.active_connections[ride_id].remove(ws)
+
     async def broadcast(self, ride_id: int, msg: dict):
         if ride_id in self.active_connections:
             for c in list(self.active_connections[ride_id]):
                 try: await c.send_text(json.dumps(msg))
                 except: pass
-    async def connect_driver(self, ws: WebSocket):
+
+    async def connect_driver(self, ws: WebSocket, vehicle_type: str = ""):
         await ws.accept()
-        self.driver_connections.append(ws)
-        print(f"Driver WS Connected: Total {len(self.driver_connections)}")
+        self.driver_connections.append({"ws": ws, "vehicle_type": vehicle_type.lower()})
+        print(f"Driver WS Connected: {vehicle_type} - Total {len(self.driver_connections)}")
+
     def disconnect_driver(self, ws: WebSocket):
-        if ws in self.driver_connections:
-            self.driver_connections.remove(ws)
+        self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
+
     async def broadcast_new_ride(self, ride_data: dict):
-        print(f"Broadcasting new ride to {len(self.driver_connections)} drivers via WS")
-        for ws in list(self.driver_connections):
+        req_type = str(ride_data.get('vehicle_type','')).lower().strip()
+        print(f"Broadcasting {req_type} ride to drivers via WS")
+        for driver in list(self.driver_connections):
+            ws = driver["ws"]
+            driver_v_type = driver["vehicle_type"]
+            # सिर्फ उसी vehicle_type वाले को भेजो
+            if req_type and req_type not in driver_v_type and driver_v_type not in req_type:
+                # अगर driver का type खाली है तो सबको भेजो (पुराने drivers के लिए)
+                if driver_v_type!= "":
+                    continue
             try:
                 await ws.send_text(json.dumps({"type":"new_ride_alert","data":ride_data}))
             except:
-                try: self.driver_connections.remove(ws)
+                try: self.driver_connections.remove(driver)
                 except: pass
+
+
 
 manager = ConnectionManager()
 
@@ -354,8 +369,8 @@ def cancel_ride(ride_id: int, user_id: str=Query(...)):
     return {"success":True}
 
 @app.websocket("/ws/drivers")
-async def ws_drivers(ws: WebSocket, city: str = Query("Sikar")):
-    await manager.connect_driver(ws)
+async def ws_drivers(ws: WebSocket, city: str = Query("Sikar"), vehicle_type: str = Query("")):
+    await manager.connect_driver(ws, vehicle_type)
     try:
         while True:
             await ws.receive_text()
