@@ -15,7 +15,7 @@ app = FastAPI(title="Taxi API - FCM High Priority Fixed")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -73,47 +73,43 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ===== FCM HIGH PRIORITY FUNCTION =====
 def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
     try:
         if not firebase_admin._apps:
             print("Firebase not initialized, skipping FCM")
             return
 
-        # सभी Online Drivers के Token निकालो
-        q = supabase.table("drivers").select("fcm_token,is_online").eq("is_online", True).neq("fcm_token", None).neq("fcm_token", "")
+        # सिर्फ उसी vehicle_type वाले Online Drivers के Token निकालो
+        q = supabase.table("drivers").select("fcm_token,vehicle_type").eq("is_online", True).neq("fcm_token", None).neq("fcm_token", "")
+        if vehicle_type and vehicle_type.strip() != "":
+            q = q.ilike("vehicle_type", f"%{vehicle_type.strip()}%")
+        
         drivers = q.execute().data or []
         tokens = [d['fcm_token'] for d in drivers if d.get('fcm_token')]
         tokens = list(set(tokens))
 
         if not tokens:
-            print("No FCM tokens found for drivers")
+            print(f"No FCM tokens found for vehicle_type: {vehicle_type}")
             return
 
-        print(f"Sending FCM High Priority to {len(tokens)} drivers")
+        print(f"Sending FCM to {len(tokens)} drivers for {vehicle_type}")
 
         trip = ride_data.get('trip_type', 'ride')
         title = '🔔 नई Ride आई है!' if trip == 'ride' else '📦 नया Parcel आया है!'
-        body_text = f"{ride_data.get('pickup_address','New')} -> {ride_data.get('drop_address','')} | ₹{ride_data.get('fare','')}"
+        body_text = f"{ride_data.get('pickup_address','New')} -> {ride_data.get('drop_address','')} | ₹{ride_data.get('fare','')} | {vehicle_type}"
 
+        # DATA-ONLY MESSAGE - तभी आपका alert.mp3 बजेगा
         message = messaging.MulticastMessage(
             android=messaging.AndroidConfig(
                 priority='high',
-                notification=messaging.AndroidNotification(
-                    channel_id='ride_channel_v4',
-                    sound='alert',
-                    priority='high',
-                    visibility='public',
-                ),
-            ),
-            notification=messaging.Notification(
-                title=title,
-                body=body_text
             ),
             data={
                 'type': 'new_ride_alert',
+                'title': title,
+                'body': body_text,
                 'ride_id': str(ride_data.get('id','')),
                 'trip_type': str(trip),
+                'vehicle_type': str(vehicle_type),
                 'pickup': str(ride_data.get('pickup_address','')),
                 'fare': str(ride_data.get('fare','')),
                 'click_action': 'FLUTTER_NOTIFICATION_CLICK'
@@ -124,13 +120,10 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
         response = messaging.send_each_for_multicast(message)
         print(f"FCM Sent: {response.success_count} success, {response.failure_count} fail")
         
-        if response.failure_count > 0:
-            for idx, resp in enumerate(response.responses):
-                if not resp.success:
-                    print(f"Failed token Error: {resp.exception}")
-
     except Exception as e:
         print(f"FCM Error: {e}")
+
+
 
 class UserInitRequest(BaseModel): device_id: str
 class RideCreateRequest(BaseModel):
