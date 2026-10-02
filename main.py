@@ -241,27 +241,46 @@ def get_vehicles():
 
 @app.put("/rides/{ride_id}/accept")
 def accept_ride(ride_id: int, driver_id: str=Query(...)):
-    d_res = supabase.table("drivers").select("id,name,phone").eq("id",driver_id).execute()
-    if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone").eq("driver_id",driver_id).execute()
-    if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
+    try:
+        # 1. Driver निकालो vehicle_number के साथ
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,vehicle_model").eq("id",driver_id).execute()
+        if not d_res.data:
+            d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,vehicle_model").eq("driver_id",driver_id).execute()
+        if not d_res.data:
+            raise HTTPException(status_code=404, detail="Driver not found")
 
-    driver=d_res.data[0]
-    new_token, clean_id = generate_stringee_token(driver["id"], str(ride_id))
-    if not new_token: raise HTTPException(status_code=500, detail="STRINGEE keys missing")
+        driver = d_res.data[0]
+        new_token, clean_id = generate_stringee_token(driver["id"], str(ride_id))
+        if not new_token:
+            raise HTTPException(status_code=500, detail="STRINGEE keys missing")
 
-    ride_update = {
-        "driver_id": driver["id"], "status":"accepted",
-        "driver_name": driver.get("name"), "driver_phone": driver.get("phone"),
-        "driver_stringee_token": new_token,
-        "driver_stringee_user_id": clean_id,
-        "accepted_at": datetime.now().isoformat()
-    }
-    supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
-    ride = supabase.table("rides").select("*").eq("id",ride_id).execute()
-    if not ride.data:
-        raise HTTPException(status_code=404, detail="Ride already taken")
-    return {"success":True,"ride":ride.data[0],"stringee_token":new_token,"stringee_user_id":clean_id}
+        # 2. Rides table में update - vehicle_number save होगा
+        ride_update = {
+            "driver_id": driver["id"],
+            "status": "accepted",
+            "driver_name": driver.get("name"),
+            "driver_phone": driver.get("phone"),
+            "vehicle_number": driver.get("vehicle_number"), # यही Main Fix है
+            "vehicle_type": driver.get("vehicle_type"),
+            "driver_stringee_token": new_token,
+            "driver_stringee_user_id": clean_id,
+            "accepted_at": datetime.now().isoformat()
+        }
+
+        # सिर्फ pending ride ही accept हो
+        updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
+
+        if not updated.data:
+            raise HTTPException(status_code=404, detail="Ride already taken or not found")
+
+        return {"success":True, "ride":updated.data[0], "stringee_token":new_token, "stringee_user_id":clean_id}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Accept Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/rides/{ride_id}/verify-otp")
 def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
@@ -350,7 +369,7 @@ async def ws_ride(ws: WebSocket, ride_id: int):
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
     try:
-        res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started"]).order("id", desc=True).limit(1).execute()
+        res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(1).execute()
         if res.data and len(res.data) > 0:
             return {"active": True, "ride": res.data[0]}
         return {"active": False, "ride": None}
