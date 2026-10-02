@@ -83,9 +83,7 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
         # सभी Online Drivers के Token निकालो
         q = supabase.table("drivers").select("fcm_token,is_online").eq("is_online", True).neq("fcm_token", None).neq("fcm_token", "")
         drivers = q.execute().data or []
-
         tokens = [d['fcm_token'] for d in drivers if d.get('fcm_token')]
-        # Duplicate हटाओ
         tokens = list(set(tokens))
 
         if not tokens:
@@ -94,37 +92,43 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
 
         print(f"Sending FCM High Priority to {len(tokens)} drivers")
 
-        # High Priority Message with Custom Sound alert.mp3
+        trip = ride_data.get('trip_type', 'ride')
+        title = '🔔 नई Ride आई है!' if trip == 'ride' else '📦 नया Parcel आया है!'
+        body_text = f"{ride_data.get('pickup_address','New')} -> {ride_data.get('drop_address','')} | ₹{ride_data.get('fare','')}"
+
         message = messaging.MulticastMessage(
             android=messaging.AndroidConfig(
                 priority='high',
                 notification=messaging.AndroidNotification(
-                    channel_id='ride_channel_v3',
+                    channel_id='ride_channel_v4',
                     sound='alert',
                     priority='high',
                     visibility='public',
-                    default_vibrate_timings=False,
                 ),
             ),
             notification=messaging.Notification(
-                title='🔔 नई Ride आई है!',
-                body=f"{ride_data.get('pickup_address','New Ride')} -> {ride_data.get('drop_address','')} | ₹{ride_data.get('fare','')}"
+                title=title,
+                body=body_text
             ),
             data={
                 'type': 'new_ride_alert',
                 'ride_id': str(ride_data.get('id','')),
+                'trip_type': str(trip),
                 'pickup': str(ride_data.get('pickup_address','')),
                 'fare': str(ride_data.get('fare','')),
                 'click_action': 'FLUTTER_NOTIFICATION_CLICK'
             },
             tokens=tokens
         )
-        response = messaging.send_multicast(message)
+
+        response = messaging.send_each_for_multicast(message)
         print(f"FCM Sent: {response.success_count} success, {response.failure_count} fail")
+        
         if response.failure_count > 0:
             for idx, resp in enumerate(response.responses):
                 if not resp.success:
-                    print(f"Failed token {tokens[idx][:20]}... Error: {resp.exception}")
+                    print(f"Failed token Error: {resp.exception}")
+
     except Exception as e:
         print(f"FCM Error: {e}")
 
@@ -243,9 +247,9 @@ def get_vehicles():
 def accept_ride(ride_id: int, driver_id: str=Query(...)):
     try:
         # 1. Driver निकालो vehicle_number के साथ
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,vehicle_model").eq("id",driver_id).execute()
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id",driver_id).execute()
         if not d_res.data:
-            d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,vehicle_model").eq("driver_id",driver_id).execute()
+            d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id",driver_id).execute()
         if not d_res.data:
             raise HTTPException(status_code=404, detail="Driver not found")
 
@@ -312,25 +316,34 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     token, clean_id = generate_stringee_token(user_id)
     ride_data = {
-        "user_id":user_id,"pickup_lat":payload.pickup_lat,"pickup_lng":payload.pickup_lng,
-        "drop_lat":payload.drop_lat,"drop_lng":payload.drop_lng,
-        "pickup_address":payload.pickup_address,"drop_address":payload.drop_address,
-        "vehicle_type":payload.vehicle_type,"distance":payload.distance,"fare":payload.fare,
-        "status":"pending","otp":payload.otp,"city":"Sikar",
+        "user_id":user_id,
+        "pickup_lat":payload.pickup_lat,
+        "pickup_lng":payload.pickup_lng,
+        "drop_lat":payload.drop_lat,
+        "drop_lng":payload.drop_lng,
+        "pickup_address":payload.pickup_address,
+        "drop_address":payload.drop_address,
+        "vehicle_type":payload.vehicle_type,
+        "distance":payload.distance,
+        "fare":payload.fare,
+        "trip_type": payload.trip_type, # ride या parcel
+        "scheduled_time": payload.scheduled_time,
+        "status":"pending",
+        "otp":payload.otp,
+        "city":"Sikar",
         "created_at":datetime.now().isoformat(),
-        "stringee_token":token,"stringee_user_id":clean_id
+        "stringee_token":token,
+        "stringee_user_id":clean_id
     }
     res = supabase.table("rides").insert(ride_data).execute()
-    new_ride=res.data[0]
+    new_ride = res.data[0]
 
-    # 1. WebSocket Broadcast (Foreground)
-    broadcast_data = {k: v for k, v in new_ride.items() if k!= "otp"}
-    await manager.broadcast_new_ride(broadcast_data)
-
-    # 2. FCM High Priority (Background + Kill)
+    await manager.broadcast_new_ride(new_ride)
     send_fcm_high_priority_to_drivers(new_ride, payload.vehicle_type)
 
     return new_ride
+
+
 
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: int):
