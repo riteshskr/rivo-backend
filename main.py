@@ -1,4 +1,4 @@
-import os, json, time, jwt, uuid, math
+import os, json, time, jwt, uuid, math, httpx
 from datetime import datetime
 from typing import Optional, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
@@ -10,36 +10,45 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Taxi API - Final With Range & Live Location")
+app = FastAPI(title="Rivo Taxi API - Final Production")
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware, 
+    allow_origins=["*"], 
+    allow_credentials=False, 
+    allow_methods=["*"], 
+    allow_headers=["*"]
+)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise Exception("SUPABASE_URL / KEY .env में नहीं है")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 
 try:
     fj = os.getenv("FIREBASE_CREDENTIALS_JSON")
     if fj and not firebase_admin._apps:
         cred = credentials.Certificate(json.loads(fj))
         firebase_admin.initialize_app(cred)
-        print("Firebase OK")
+        print("✅ Firebase OK")
 except Exception as e:
-    print(f"Firebase Error: {e}")
+    print(f"❌ Firebase Error: {e}")
 
 def haversine(lat1, lon1, lat2, lon2):
     try:
-        R = 6371
+        R = 6371.0
         dlat = math.radians(lat2 - lat1)
         dlon = math.radians(lon2 - lon1)
         a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
         c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
         return R * c
     except:
-        return 99999
+        return 99999.0
 
 class ConnectionManager:
     def __init__(self):
@@ -66,28 +75,30 @@ class ConnectionManager:
 
     async def connect_driver(self, ws: WebSocket, vehicle_type: str = ""):
         await ws.accept()
+        # पहले से है तो हटाओ
+        self.driver_connections = [d for d in self.driver_connections if d["ws"] != ws]
         self.driver_connections.append({"ws": ws, "vehicle_type": vehicle_type.lower().strip()})
+        print(f"Driver WS Connected: {vehicle_type} - Total: {len(self.driver_connections)}")
 
     def disconnect_driver(self, ws: WebSocket):
-        self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
+        self.driver_connections = [d for d in self.driver_connections if d["ws"] != ws]
 
     async def broadcast_new_ride(self, ride_data: dict):
         req_type = str(ride_data.get('vehicle_type','')).lower().strip()
         trip = str(ride_data.get('trip_type','ride')).lower()
+        dead = []
         for driver in list(self.driver_connections):
             ws = driver["ws"]
             driver_v = str(driver.get("vehicle_type","")).lower().strip()
-            if not driver_v:
-                continue
-            if req_type and driver_v!= req_type:
+            if driver_v and req_type and driver_v != req_type:
                 continue
             try:
                 await ws.send_text(json.dumps({"type":"new_ride_alert","ride":ride_data,"vehicle_type":req_type,"trip_type":trip}))
             except:
-                try:
-                    self.driver_connections.remove(driver)
-                except:
-                    pass
+                dead.append(driver)
+        for d in dead:
+            try: self.driver_connections.remove(d)
+            except: pass
 
 manager = ConnectionManager()
 
@@ -106,13 +117,39 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
                 tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
         if not tokens:
+            print(f"No online drivers for {v_type}")
             return
+        
+        # High Priority Notification
         trip = ride_data.get('trip_type','ride')
-        msg = messaging.MulticastMessage(
-            data={'vehicle_type': v_type, 'trip_type': str(trip), 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert'},
-            tokens=tokens
+        is_parcel = "parcel" in str(trip).lower()
+        title = "📦 नई Parcel आई है!" if is_parcel else f"🔔 नई {vehicle_type} Ride आई है!"
+        body = f"{ride_data.get('pickup_address','')} -> {ride_data.get('drop_address','')}"
+        
+        # Android के लिए High Priority
+        android_config = messaging.AndroidConfig(
+            priority='high',
+            notification=messaging.AndroidNotification(
+                channel_id='ride_channel_v5',
+                priority='max',
+                visibility='public',
+                sound='alert'
+            )
         )
-        messaging.send_each_for_multicast(msg)
+        msg = messaging.MulticastMessage(
+            notification=messaging.Notification(title=title, body=body),
+            data={
+                'vehicle_type': v_type, 
+                'trip_type': str(trip), 
+                'ride_id': str(ride_data.get('id','')), 
+                'type': 'new_ride_alert',
+                'click_action': 'FLUTTER_NOTIFICATION_CLICK'
+            },
+            tokens=tokens,
+            android=android_config
+        )
+        res = messaging.send_each_for_multicast(msg)
+        print(f"FCM Sent: {res.success_count} success, {res.failure_count} fail")
     except Exception as e:
         print(f"FCM Error {e}")
 
@@ -164,7 +201,7 @@ def init_user(p: UserInitRequest):
 def driver_login(p: DriverLoginRequest):
     login_id = (p.driver_id or p.phone or "").strip()
     if not login_id:
-        raise HTTPException(status_code=400, detail="Driver ID")
+        raise HTTPException(status_code=400, detail="Driver ID required")
     res = supabase.table("drivers").select("*").eq("driver_id", login_id).execute()
     if not res.data:
         res = supabase.table("drivers").select("*").eq("id", login_id).execute()
@@ -175,9 +212,47 @@ def driver_login(p: DriverLoginRequest):
     driver=res.data[0]
     if str(driver.get("password","")).strip()!= str(p.password).strip():
         raise HTTPException(status_code=401, detail="Password गलत")
-    supabase.table("drivers").update({"is_online":True,"available":True,"fcm_token":p.fcm_token or driver.get("fcm_token"),"last_seen":datetime.now().isoformat()}).eq("id",driver["id"]).execute()
+    supabase.table("drivers").update({
+        "is_online":True,
+        "available":True,
+        "fcm_token":p.fcm_token or driver.get("fcm_token"),
+        "last_seen":datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat()
+    }).eq("id",driver["id"]).execute()
     d = supabase.table("drivers").select("*").eq("id",driver["id"]).execute().data[0]
     return {"success":True,"driver":d}
+
+# ============ NEW SECURE MAPS API - FLUTTER APP के लिए ============
+@app.get("/maps/directions")
+async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)):
+    """
+    Flutter App से Secure Route
+    origin = "27.61,75.14" , dest = "27.62,75.15"
+    Google Key Backend में ही Safe रहेगी
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not set in .env")
+    try:
+        url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={dest}&key={GOOGLE_MAPS_API_KEY}&language=hi&overview=full"
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            data = r.json()
+            if data.get("status") == "OK":
+                route = data["routes"][0]
+                leg = route["legs"][0]
+                return {
+                    "points": route["overview_polyline"]["points"],
+                    "distance_text": leg["distance"]["text"],
+                    "distance_value": leg["distance"]["value"],
+                    "duration_text": leg["duration"]["text"],
+                    "duration_value": leg["duration"]["value"],
+                }
+            else:
+                print(f"Google API Error: {data}")
+                raise HTTPException(status_code=400, detail=f"Google Error: {data.get('status')}")
+    except Exception as e:
+        print(f"Directions Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============ LIVE LOCATION APIS ============
 @app.put("/drivers/{driver_id}/location")
@@ -187,12 +262,14 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
         lng = payload.longitude if payload.longitude is not None else payload.lng
         if lat is None or lng is None:
             raise HTTPException(status_code=400, detail="lat/lng required")
+        
         d_res = supabase.table("drivers").select("id").eq("id", driver_id).execute()
         if not d_res.data:
             d_res = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
         if not d_res.data:
             raise HTTPException(status_code=404, detail="Driver not found")
         real_id = d_res.data[0]["id"]
+        
         supabase.table("drivers").update({
             "current_latitude": lat,
             "current_longitude": lng,
@@ -200,13 +277,17 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
             "updated_at": datetime.now().isoformat(),
             "is_online": True
         }).eq("id", real_id).execute()
+        
+        # Active Ride में भी driver location update करो ताकि User को Live दिखे
         try:
             supabase.table("rides").update({
                 "driver_lat": lat,
-                "driver_lng": lng
+                "driver_lng": lng,
+                "driver_last_location_at": datetime.now().isoformat()
             }).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
-        except:
-            pass
+        except Exception as e:
+            print(f"Ride location update fail: {e}")
+
         return {"success": True, "lat": lat, "lng": lng}
     except HTTPException:
         raise
@@ -216,9 +297,9 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
 
 @app.get("/drivers/{driver_id}/location")
 def get_driver_location(driver_id: str):
-    res = supabase.table("drivers").select("id, current_latitude, current_longitude, last_seen, range, vehicle_type").eq("id", driver_id).execute()
+    res = supabase.table("drivers").select("id, current_latitude, current_longitude, last_seen, range, vehicle_type, name").eq("id", driver_id).execute()
     if not res.data:
-        res = supabase.table("drivers").select("id, current_latitude, current_longitude, last_seen, range, vehicle_type").eq("driver_id", driver_id).execute()
+        res = supabase.table("drivers").select("id, current_latitude, current_longitude, last_seen, range, vehicle_type, name").eq("driver_id", driver_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Driver not found")
     return res.data[0]
@@ -251,31 +332,32 @@ def pending_rides(
                 if not d_vehicle:
                     d_vehicle = drv.get("vehicle_type")
 
-        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True)
+        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(50)
         if d_vehicle and d_vehicle.strip()!= "":
             q = q.eq("vehicle_type", d_vehicle.strip())
 
         res = q.execute()
         rides = res.data or []
 
-        # Range null है तो सिर्फ vehicle_type से दिखाओ
         if driver_range is None or d_lat is None or d_lng is None:
             for r in rides:
                 r.pop("otp", None)
             return rides
 
-        # Range है तो distance check करो
         filtered = []
         for ride in rides:
             try:
                 p_lat = float(ride.get("pickup_lat", 0))
                 p_lng = float(ride.get("pickup_lng", 0))
+                if p_lat == 0 or p_lng == 0:
+                    continue
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
                 if dist <= float(driver_range):
                     ride["distance_from_driver"] = round(dist, 2)
                     ride.pop("otp", None)
                     filtered.append(ride)
-            except:
+            except Exception as ex:
+                print(f"Filter error: {ex}")
                 continue
 
         filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
@@ -283,7 +365,7 @@ def pending_rides(
 
     except Exception as e:
         print(f"Pending Error: {e}")
-        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True)
+        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(50)
         if vehicle_type and vehicle_type.strip()!= "":
             q = q.eq("vehicle_type", vehicle_type.strip())
         res = q.execute()
@@ -300,7 +382,7 @@ def get_vehicles():
             return res.data
     except:
         pass
-    return [{"id":1,"name":"Mini"}]
+    return [{"id":1,"name":"Mini", "base_fare": 50}]
 
 @app.put("/rides/{ride_id}/accept")
 def accept_ride(ride_id: int, driver_id: str=Query(...)):
@@ -311,10 +393,24 @@ def accept_ride(ride_id: int, driver_id: str=Query(...)):
         raise HTTPException(status_code=404, detail="Driver not found")
     driver = d_res.data[0]
     new_token, clean_id = generate_stringee_token(driver["id"], str(ride_id))
-    ride_update = {"driver_id": driver["id"],"status": "accepted","driver_name": driver.get("name"),"driver_phone": driver.get("phone"),"vehicle_number": driver.get("vehicle_number"),"vehicle_type": driver.get("vehicle_type"),"driver_stringee_token": new_token,"driver_stringee_user_id": clean_id,"accepted_at": datetime.now().isoformat()}
+    if not new_token:
+        new_token = f"temp_{driver['id']}"
+        clean_id = str(driver["id"])
+
+    ride_update = {
+        "driver_id": driver["id"],
+        "status": "accepted",
+        "driver_name": driver.get("name"),
+        "driver_phone": driver.get("phone"),
+        "vehicle_number": driver.get("vehicle_number"),
+        "vehicle_type": driver.get("vehicle_type"),
+        "driver_stringee_token": new_token,
+        "driver_stringee_user_id": clean_id,
+        "accepted_at": datetime.now().isoformat()
+    }
     updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
     if not updated.data:
-        raise HTTPException(status_code=404, detail="Ride taken")
+        raise HTTPException(status_code=409, detail="Ride already taken by another driver")
     return {"success":True, "ride":updated.data[0], "stringee_token":new_token, "stringee_user_id":clean_id}
 
 @app.post("/rides/{ride_id}/verify-otp")
@@ -324,7 +420,7 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
         raise HTTPException(status_code=404, detail="Ride not found")
     ride = res.data[0]
     if ride["status"] == "started":
-        return {"success": True}
+        return {"success": True, "message": "Already started"}
     if str(ride.get("otp","")).strip()!= str(payload.otp).strip():
         raise HTTPException(status_code=400, detail="Galat OTP")
     supabase.table("rides").update({"status": "started","started_at": datetime.now().isoformat()}).eq("id", ride_id).execute()
@@ -333,8 +429,29 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     token, clean_id = generate_stringee_token(user_id)
-    ride_data = {"user_id":user_id,"pickup_lat":payload.pickup_lat,"pickup_lng":payload.pickup_lng,"drop_lat":payload.drop_lat,"drop_lng":payload.drop_lng,"pickup_address":payload.pickup_address,"drop_address":payload.drop_address,"vehicle_type":payload.vehicle_type,"distance":payload.distance,"fare":payload.fare,"trip_type": payload.trip_type,"scheduled_time": payload.scheduled_time,"status":"pending","otp":payload.otp,"city":"Sikar","created_at":datetime.now().isoformat(),"stringee_token":token,"stringee_user_id":clean_id}
+    ride_data = {
+        "user_id":user_id,
+        "pickup_lat":payload.pickup_lat,
+        "pickup_lng":payload.pickup_lng,
+        "drop_lat":payload.drop_lat,
+        "drop_lng":payload.drop_lng,
+        "pickup_address":payload.pickup_address,
+        "drop_address":payload.drop_address,
+        "vehicle_type":payload.vehicle_type,
+        "distance":payload.distance,
+        "fare":payload.fare,
+        "trip_type": payload.trip_type,
+        "scheduled_time": payload.scheduled_time,
+        "status":"pending",
+        "otp":payload.otp,
+        "city":"Sikar",
+        "created_at":datetime.now().isoformat(),
+        "stringee_token":token,
+        "stringee_user_id":clean_id
+    }
     res = supabase.table("rides").insert(ride_data).execute()
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create ride")
     new_ride = res.data[0]
     await manager.broadcast_new_ride(new_ride)
     send_fcm_high_priority_to_drivers(new_ride, payload.vehicle_type)
@@ -343,7 +460,9 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: int):
     res=supabase.table("rides").select("*").eq("id",ride_id).execute()
-    return res.data[0] if res.data else {"error":"not found"}
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Ride not found")
+    return res.data[0]
 
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int):
@@ -352,7 +471,7 @@ def complete_ride(ride_id: int):
 
 @app.put("/rides/{ride_id}/cancel")
 def cancel_ride(ride_id: int, user_id: str=Query(...)):
-    supabase.table("rides").update({"status":"cancelled"}).eq("id",ride_id).execute()
+    supabase.table("rides").update({"status":"cancelled", "cancelled_at": datetime.now().isoformat()}).eq("id",ride_id).execute()
     return {"success":True}
 
 @app.websocket("/ws/drivers")
@@ -360,9 +479,24 @@ async def ws_drivers(ws: WebSocket, city: str = Query("Sikar"), vehicle_type: st
     await manager.connect_driver(ws, vehicle_type)
     try:
         while True:
-            await ws.receive_text()
+            # Ping-pong ताकि connection alive रहे
+            try:
+                data = await ws.receive_text()
+                # Driver अपना updated vehicle_type भेज सकता है
+                try:
+                    j = json.loads(data)
+                    if "vehicle_type" in j:
+                        # update
+                        for d in manager.driver_connections:
+                            if d["ws"] == ws:
+                                d["vehicle_type"] = str(j["vehicle_type"]).lower().strip()
+                except:
+                    pass
+            except:
+                await ws.receive_text()
     except WebSocketDisconnect:
         manager.disconnect_driver(ws)
+        print(f"Driver WS Disconnected")
 
 @app.websocket("/ws/rides/{ride_id}")
 async def ws_ride(ws: WebSocket, ride_id: int):
@@ -370,17 +504,32 @@ async def ws_ride(ws: WebSocket, ride_id: int):
     try:
         while True:
             data = await ws.receive_text()
-            await manager.broadcast(ride_id, json.loads(data))
+            try:
+                await manager.broadcast(ride_id, json.loads(data))
+            except:
+                await manager.broadcast(ride_id, {"raw": data})
     except WebSocketDisconnect:
         manager.disconnect(ride_id, ws)
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
+    # id और driver_id दोनों से check
     res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(1).execute()
+    if not res.data:
+        # कभी-कभी driver_id field में driver_id string है, id नहीं
+        res = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
+        if res.data:
+            real_id = res.data[0]["id"]
+            res = supabase.table("rides").select("*").eq("driver_id", real_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(1).execute()
     if res.data:
         return {"active": True, "ride": res.data[0]}
     return {"active": False, "ride": None}
 
 @app.get("/")
 def root():
-    return {"status":"Final - Range + Live Location + Vehicle Filter"}
+    return {
+        "status":"Rivo API - Final Production",
+        "version": "2.0",
+        "features": ["Range Filter", "Live Location", "Vehicle Filter", "Secure Maps API", "FCM High Priority"],
+        "maps_api": "/maps/directions?origin=27.61,75.14&dest=27.62,75.15"
+    }
