@@ -93,50 +93,48 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
         if not firebase_admin._apps:
             print("Firebase not initialized, skipping FCM")
             return
-
+         v_type = vehicle_type.strip().lower()
+        if not v_type:
+            print("No vehicle_type in ride - STOP, not sending to all")
+            return
         # सिर्फ उसी vehicle_type वाले Online Drivers के Token निकालो
-        q = supabase.table("drivers").select("fcm_token,vehicle_type").eq("is_online", True).neq("fcm_token", None).neq("fcm_token", "")
-        if vehicle_type and vehicle_type.strip() != "":
-            q = q.ilike("vehicle_type", f"%{vehicle_type.strip()}%")
+       def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
+    try:
+        if not firebase_admin._apps:
+            return
+        v_type = vehicle_type.strip().lower()
+        if not v_type:
+            print("No vehicle_type in ride - STOP, not sending to all")
+            return
+
+        # सिर्फ उसी vehicle_type के Online Drivers
+        drivers = supabase.table("drivers").select("fcm_token,vehicle_type").eq("is_online", True).ilike("vehicle_type", v_type).neq("fcm_token", "").execute().data or []
         
-        drivers = q.execute().data or []
         tokens = [d['fcm_token'] for d in drivers if d.get('fcm_token')]
         tokens = list(set(tokens))
 
+        print(f"Ride vehicle: {v_type} -> Found {len(tokens)} drivers with same vehicle")
+
         if not tokens:
-            print(f"No FCM tokens found for vehicle_type: {vehicle_type}")
+            print(f"ZERO drivers for {v_type} - Not sending")
             return
 
-        print(f"Sending FCM to {len(tokens)} drivers for {vehicle_type}")
+        trip = ride_data.get('trip_type','ride')
+        title = '📦 नया Parcel!' if trip.lower()=='parcel' else f'🔔 नई {v_type} Ride!'
 
-        trip = ride_data.get('trip_type', 'ride')
-        title = '🔔 नई Ride आई है!' if trip == 'ride' else '📦 नया Parcel आया है!'
-        body_text = f"{ride_data.get('pickup_address','New')} -> {ride_data.get('drop_address','')} | ₹{ride_data.get('fare','')} | {vehicle_type}"
-
-        # DATA-ONLY MESSAGE - तभी आपका alert.mp3 बजेगा
-        message = messaging.MulticastMessage(
-            android=messaging.AndroidConfig(
-                priority='high',
-            ),
+        msg = messaging.MulticastMessage(
             data={
-                'type': 'new_ride_alert',
                 'title': title,
-                'body': body_text,
-                'ride_id': str(ride_data.get('id','')),
-                'trip_type': str(trip),
-                'vehicle_type': str(vehicle_type),
-                'pickup': str(ride_data.get('pickup_address','')),
-                'fare': str(ride_data.get('fare','')),
-                'click_action': 'FLUTTER_NOTIFICATION_CLICK'
+                'body': f"{ride_data.get('pickup_address','')} ₹{ride_data.get('fare','')}",
+                'trip_type': trip,
+                'vehicle_type': v_type,
             },
             tokens=tokens
         )
-
-        response = messaging.send_each_for_multicast(message)
-        print(f"FCM Sent: {response.success_count} success, {response.failure_count} fail")
-        
+        res = messaging.send_each_for_multicast(msg)
+        print(f"FCM {v_type} {trip}: {res.success_count} sent")
     except Exception as e:
-        print(f"FCM Error: {e}")
+        print(f"FCM Error {e}")
 
 
 
