@@ -1,4 +1,4 @@
-import os, json, time, jwt, uuid
+import os, json, time, jwt, uuid, math
 from datetime import datetime
 from typing import Optional, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Taxi API - Fixed")
+app = FastAPI(title="Taxi API - Final With Range & Live Location")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -29,6 +29,17 @@ try:
         print("Firebase OK")
 except Exception as e:
     print(f"Firebase Error: {e}")
+
+def haversine(lat1, lon1, lat2, lon2):
+    try:
+        R = 6371
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return R * c
+    except:
+        return 99999
 
 class ConnectionManager:
     def __init__(self):
@@ -56,7 +67,6 @@ class ConnectionManager:
     async def connect_driver(self, ws: WebSocket, vehicle_type: str = ""):
         await ws.accept()
         self.driver_connections.append({"ws": ws, "vehicle_type": vehicle_type.lower().strip()})
-        print(f"Driver WS: {vehicle_type} Total {len(self.driver_connections)}")
 
     def disconnect_driver(self, ws: WebSocket):
         self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
@@ -64,14 +74,12 @@ class ConnectionManager:
     async def broadcast_new_ride(self, ride_data: dict):
         req_type = str(ride_data.get('vehicle_type','')).lower().strip()
         trip = str(ride_data.get('trip_type','ride')).lower()
-        print(f"WS Broadcast {req_type} {trip} to {len(self.driver_connections)} drivers")
         for driver in list(self.driver_connections):
             ws = driver["ws"]
             driver_v = str(driver.get("vehicle_type","")).lower().strip()
             if not driver_v:
                 continue
             if req_type and driver_v!= req_type:
-                print(f"WS SKIP {driver_v}!= {req_type}")
                 continue
             try:
                 await ws.send_text(json.dumps({"type":"new_ride_alert","ride":ride_data,"vehicle_type":req_type,"trip_type":trip}))
@@ -89,7 +97,6 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
             return
         v_type = vehicle_type.strip().lower()
         if not v_type:
-            print("No vehicle_type STOP")
             return
         all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,driver_id").eq("is_online", True).neq("fcm_token", "").execute().data or []
         tokens = []
@@ -98,11 +105,6 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
             if d_v == v_type and d.get('fcm_token'):
                 tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
-        print(f"RIDE {v_type} ALL:{len(all_drivers)} MATCH:{len(tokens)}")
-        for d in all_drivers:
-            d_v = str(d.get('vehicle_type','')).lower().strip()
-            status = "SEND" if d_v == v_type else "SKIP"
-            print(f" {d.get('driver_id')}={d_v} -> {status}")
         if not tokens:
             return
         trip = ride_data.get('trip_type','ride')
@@ -110,8 +112,7 @@ def send_fcm_high_priority_to_drivers(ride_data: dict, vehicle_type: str = ""):
             data={'vehicle_type': v_type, 'trip_type': str(trip), 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert'},
             tokens=tokens
         )
-        res = messaging.send_each_for_multicast(msg)
-        print(f"FCM Sent {res.success_count}")
+        messaging.send_each_for_multicast(msg)
     except Exception as e:
         print(f"FCM Error {e}")
 
@@ -129,6 +130,10 @@ class DriverLoginRequest(BaseModel):
 
 class OtpVerifyRequest(BaseModel):
     otp: str
+
+class DriverLocationRequest(BaseModel):
+    lat: Optional[float]=None; lng: Optional[float]=None
+    latitude: Optional[float]=None; longitude: Optional[float]=None
 
 def generate_stringee_token(user_id: str, ride_id: str=""):
     if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET:
@@ -174,16 +179,118 @@ def driver_login(p: DriverLoginRequest):
     d = supabase.table("drivers").select("*").eq("id",driver["id"]).execute().data[0]
     return {"success":True,"driver":d}
 
+# ============ LIVE LOCATION APIS ============
+@app.put("/drivers/{driver_id}/location")
+def update_driver_location(driver_id: str, payload: DriverLocationRequest):
+    try:
+        lat = payload.latitude if payload.latitude is not None else payload.lat
+        lng = payload.longitude if payload.longitude is not None else payload.lng
+        if lat is None or lng is None:
+            raise HTTPException(status_code=400, detail="lat/lng required")
+        d_res = supabase.table("drivers").select("id").eq("id", driver_id).execute()
+        if not d_res.data:
+            d_res = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
+        if not d_res.data:
+            raise HTTPException(status_code=404, detail="Driver not found")
+        real_id = d_res.data[0]["id"]
+        supabase.table("drivers").update({
+            "current_latitude": lat,
+            "current_longitude": lng,
+            "last_seen": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "is_online": True
+        }).eq("id", real_id).execute()
+        try:
+            supabase.table("rides").update({
+                "driver_lat": lat,
+                "driver_lng": lng
+            }).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
+        except:
+            pass
+        return {"success": True, "lat": lat, "lng": lng}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Location Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/drivers/{driver_id}/location")
+def get_driver_location(driver_id: str):
+    res = supabase.table("drivers").select("id, current_latitude, current_longitude, last_seen, range, vehicle_type").eq("id", driver_id).execute()
+    if not res.data:
+        res = supabase.table("drivers").select("id, current_latitude, current_longitude, last_seen, range, vehicle_type").eq("driver_id", driver_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Driver not found")
+    return res.data[0]
+
+# ============ PENDING LIST WITH RANGE & DISTANCE LOGIC ============
 @app.get("/rides/pending/list")
-def pending_rides(vehicle_type: str = Query(None)):
-    q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True)
-    if vehicle_type and vehicle_type.strip()!= "":
-        q = q.eq("vehicle_type", vehicle_type.strip())
-    res = q.execute()
-    data = res.data or []
-    for ride in data:
-        ride.pop("otp", None)
-    return data
+def pending_rides(
+    vehicle_type: str = Query(None),
+    driver_id: str = Query(None),
+    driver_lat: float = Query(None),
+    driver_lng: float = Query(None)
+):
+    try:
+        driver_range = None
+        d_lat = driver_lat
+        d_lng = driver_lng
+        d_vehicle = vehicle_type
+
+        if driver_id:
+            d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("id", driver_id).execute()
+            if not d_res.data:
+                d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("driver_id", driver_id).execute()
+            if d_res.data:
+                drv = d_res.data[0]
+                if d_lat is None:
+                    d_lat = drv.get("current_latitude")
+                if d_lng is None:
+                    d_lng = drv.get("current_longitude")
+                driver_range = drv.get("range")
+                if not d_vehicle:
+                    d_vehicle = drv.get("vehicle_type")
+
+        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True)
+        if d_vehicle and d_vehicle.strip()!= "":
+            q = q.eq("vehicle_type", d_vehicle.strip())
+
+        res = q.execute()
+        rides = res.data or []
+
+        # Range null है तो सिर्फ vehicle_type से दिखाओ
+        if driver_range is None or d_lat is None or d_lng is None:
+            for r in rides:
+                r.pop("otp", None)
+            return rides
+
+        # Range है तो distance check करो
+        filtered = []
+        for ride in rides:
+            try:
+                p_lat = float(ride.get("pickup_lat", 0))
+                p_lng = float(ride.get("pickup_lng", 0))
+                dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
+                if dist <= float(driver_range):
+                    ride["distance_from_driver"] = round(dist, 2)
+                    ride.pop("otp", None)
+                    filtered.append(ride)
+            except:
+                continue
+
+        filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
+        return filtered
+
+    except Exception as e:
+        print(f"Pending Error: {e}")
+        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True)
+        if vehicle_type and vehicle_type.strip()!= "":
+            q = q.eq("vehicle_type", vehicle_type.strip())
+        res = q.execute()
+        data = res.data or []
+        for r in data:
+            r.pop("otp", None)
+        return data
 
 @app.get("/vehicles")
 def get_vehicles():
@@ -276,5 +383,4 @@ def get_active_ride(driver_id: str):
 
 @app.get("/")
 def root():
-    return {"status":"Fixed"}
-
+    return {"status":"Final - Range + Live Location + Vehicle Filter"}
