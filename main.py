@@ -43,7 +43,6 @@ def haversine(lat1, lon1, lat2, lon2):
         return 99999.0
 
 def get_range_by_vehicle(vehicle_type: str, db_range=None):
-    """Vehicle के हिसाब से Range - Driver Table से लेगा, नहीं तो Default"""
     if db_range is not None:
         try:
             return float(db_range)
@@ -56,7 +55,7 @@ def get_range_by_vehicle(vehicle_type: str, db_range=None):
     if "mini" in vt: return 10.0
     if "sedan" in vt: return 12.0
     if "suv" in vt or "xl" in vt: return 15.0
-    return 10.0  # Default Global
+    return 10.0
 
 async def get_city_country_currency(lat: float, lng: float):
     try:
@@ -110,7 +109,6 @@ class ConnectionManager:
             if driver_v and req_type and driver_v != req_type: continue
             d_lat = driver.get("lat"); d_lng = driver.get("lng")
             if d_lat and d_lng:
-                # Driver Table से Range लेगा
                 drange = driver.get("range") or get_range_by_vehicle(driver_v)
                 dist = haversine(d_lat, d_lng, p_lat, p_lng)
                 if dist > float(drange): continue
@@ -159,6 +157,8 @@ class RideCreateRequest(BaseModel):
 
 class DriverLoginRequest(BaseModel):
     driver_id: Optional[str]=None; phone: Optional[str]=None; password: str; fcm_token: Optional[str]=None
+    mobile: Optional[str]=None
+    username: Optional[str]=None
 
 class OtpVerifyRequest(BaseModel):
     otp: str
@@ -174,6 +174,65 @@ def generate_stringee_token(user_id: str, ride_id: str=""):
     jti = f"{STRINGEE_API_KEY_SID}-{now}-{clean_id}-{ride_id}-{uuid.uuid4().hex[:6]}"
     payload = {"jti": jti, "iss": STRINGEE_API_KEY_SID, "exp": now+86400, "userId": clean_id}
     return jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256"), clean_id
+
+# ==================== DRIVER LOGIN - ID + PASSWORD ====================
+@app.post("/drivers/login")
+def driver_login(payload: DriverLoginRequest):
+    try:
+        phone_input = payload.phone or payload.mobile or payload.driver_id or payload.username
+        password_input = payload.password
+
+        print(f"LOGIN TRY: {phone_input} / {password_input}")
+
+        if not phone_input:
+            raise HTTPException(status_code=400, detail="Phone/ID required")
+
+        phone_input = str(phone_input).strip()
+
+        # 1. phone column
+        res = supabase.table("drivers").select("*").eq("phone", phone_input).execute()
+        # 2. id column (car1)
+        if not res.data:
+            res = supabase.table("drivers").select("*").eq("id", phone_input).execute()
+        # 3. driver_id column
+        if not res.data:
+            res = supabase.table("drivers").select("*").eq("driver_id", phone_input).execute()
+        # 4. mobile column (try)
+        if not res.data:
+            try:
+                res = supabase.table("drivers").select("*").eq("mobile", phone_input).execute()
+            except:
+                pass
+
+        if not res.data:
+            print(f"Driver not found: {phone_input}")
+            raise HTTPException(status_code=404, detail="Driver not found")
+
+        driver = res.data[0]
+
+        # Password check - allow both string and int
+        db_pass = str(driver.get('password','')).strip()
+        input_pass = str(password_input).strip()
+        if db_pass != input_pass:
+            print(f"Wrong password for {phone_input}: DB={db_pass} Input={input_pass}")
+            raise HTTPException(status_code=401, detail="Wrong password")
+
+        # FCM Token Update
+        if payload.fcm_token:
+            try:
+                supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now().isoformat()}).eq("id", driver["id"]).execute()
+                driver["fcm_token"] = payload.fcm_token
+            except Exception as e:
+                print(f"FCM Update Error: {e}")
+
+        print(f"LOGIN SUCCESS: {driver['id']} - {driver.get('name')}")
+        return driver
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"LOGIN ERROR: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/maps/directions")
 async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)):
@@ -202,48 +261,34 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
     except: pass
     return {"success": True}
 
-# ============ MAIN FIX: RANGE DRIVER TABLE SE VEHICLE KE ANUSAR ============
 @app.get("/rides/pending/list")
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     try:
         if not driver_id:
             raise HTTPException(status_code=400, detail="driver_id required")
-
-        # Driver Table से Range और Vehicle Type निकालो
         d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("id", driver_id).execute()
         if not d_res.data:
             d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("driver_id", driver_id).execute()
-        
         if not d_res.data:
             raise HTTPException(status_code=404, detail="Driver not found")
-        
         drv = d_res.data[0]
         d_lat = driver_lat if driver_lat is not None else drv.get("current_latitude")
         d_lng = driver_lng if driver_lng is not None else drv.get("current_longitude")
         d_vehicle = vehicle_type or drv.get("vehicle_type")
         db_range = drv.get("range")
-
-        # Vehicle के अनुसार Range - Driver Table से, नहीं तो Default
         driver_range = get_range_by_vehicle(d_vehicle, db_range)
-
         print(f"Driver: {d_vehicle} | DB Range: {db_range} | Final Range: {driver_range}km | Lat: {d_lat}, Lng: {d_lng}")
-
         if d_lat is None or d_lng is None:
-            # Location नहीं है तो सिर्फ Vehicle Type से दिखाओ
             q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(50)
             if d_vehicle: q = q.eq("vehicle_type", d_vehicle)
             res = q.execute()
             for r in res.data or []: r.pop("otp", None)
             return res.data or []
-
-        # Pending Rides उसी Vehicle की
         q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(50)
         if d_vehicle and d_vehicle.strip() != "":
             q = q.eq("vehicle_type", d_vehicle.strip())
-        
         res = q.execute()
         rides = res.data or []
-
         filtered = []
         for ride in rides:
             try:
@@ -260,10 +305,8 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
             except Exception as ex:
                 print(f"Filter error: {ex}")
                 continue
-
         filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
         return filtered
-
     except HTTPException:
         raise
     except Exception as e:
@@ -275,14 +318,7 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     city, country, currency = await get_city_country_currency(payload.pickup_lat, payload.pickup_lng)
     token, clean_id = generate_stringee_token(user_id)
     trip = str(payload.trip_type).lower().strip()
-    print(f"USER SE AAYA trip_type: {payload.trip_type} -> CLEAN: {trip}")
-
-    if trip == "parcel" or "parcel" in trip:
-        final_trip = "parcel"
-    else:
-        final_trip = "ride"
-
-    print(f"FINAL SAVE: {final_trip}")
+    final_trip = "parcel" if "parcel" in trip else "ride"
     ride_data = {
         "user_id":user_id,
         "pickup_lat":payload.pickup_lat,"pickup_lng":payload.pickup_lng,
@@ -357,4 +393,4 @@ async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = 
 
 @app.get("/")
 def root():
-    return {"status":"Rivo API Global 3.0 - Vehicle Range from Driver Table", "logic": "Bike=5km, Auto=7km, Mini=10km, SUV=15km from drivers.range"}
+    return {"status":"Rivo API Fixed - Driver Login ID+Password Working", "login_examples": ["car1 / 123", "9875262306 / 123"]}
