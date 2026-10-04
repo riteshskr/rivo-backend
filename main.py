@@ -10,12 +10,11 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final Fixed 4.0")
+app = FastAPI(title="Rivo Taxi API - Final Fixed 5.0 - Cancel Fixed")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-# FIX 1: Service Role पहले ताकि Location और Cancel RLS से न रुके
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -300,7 +299,6 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     ride_update = {"driver_id": driver["id"],"status": "accepted","driver_name": driver.get("name"),"driver_phone": driver.get("phone"),"vehicle_number": driver.get("vehicle_number"),"vehicle_type": driver.get("vehicle_type"),"driver_stringee_token": new_token,"driver_stringee_user_id": clean_id,"accepted_at": datetime.now().isoformat()}
     updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
     if not updated.data: raise HTTPException(status_code=409, detail="Already taken")
-    # सभी Drivers को बताओ Ride हट गई - FIXED
     await manager.broadcast_ride_taken(ride_id)
     return {"success":True, "ride":updated.data[0], "stringee_token":new_token}
 
@@ -352,14 +350,47 @@ async def ws_ride(ws: WebSocket, ride_id: int):
     except WebSocketDisconnect: manager.disconnect(ride_id, ws)
 
 @app.put("/rides/{ride_id}/cancel")
-def cancel_ride(ride_id: int, user_id: str = Query(None)):
+async def cancel_ride(ride_id: int, user_id: str = Query(None)):
     try:
-        updated = supabase.table("rides").update({"status": "cancelled","cancelled_at": datetime.now().isoformat()}).eq("id", ride_id).execute()
-        if not updated.data: raise HTTPException(status_code=404, detail="Ride not found")
+        print(f"CANCEL REQUEST: ride_id={ride_id} user_id={user_id}")
+        q = supabase.table("rides").update({
+            "status": "cancelled",
+            "cancelled_at": datetime.now().isoformat()
+        }).eq("id", ride_id)
+
+        if user_id and user_id.strip()!= "" and user_id!= "null":
+            res_check = supabase.table("rides").select("id").eq("id", ride_id).eq("user_id", user_id).execute()
+            if res_check.data:
+                q = q.eq("user_id", user_id)
+
+        updated = q.execute()
+
+        if not updated.data:
+            raise HTTPException(status_code=404, detail="Ride not found")
+
+        print(f"✅ Ride {ride_id} -> cancelled")
+
+        try:
+            await manager.broadcast_ride_taken(ride_id)
+            for driver in list(manager.driver_connections):
+                try:
+                    await driver["ws"].send_text(json.dumps({
+                        "type": "ride_cancelled",
+                        "ride_id": ride_id
+                    }))
+                except:
+                    pass
+        except Exception as e:
+            print(f"Broadcast cancel error: {e}")
+
         return {"success": True, "ride": updated.data[0]}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"CANCEL ERROR: {e}"); raise HTTPException(status_code=500, detail=str(e))
+        print(f"CANCEL ERROR: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-def root(): return {"status":"Rivo API Final Fixed 4.0 - All Bugs Fixed"}
+def root(): return {"status":"Rivo API Final 5.0 - Cancel & Pending Fixed"}
 
