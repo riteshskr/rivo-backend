@@ -312,6 +312,14 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
     except Exception as e:
         print(f"Pending Error: {e}")
         return []
+@app.get("/vehicles")
+def get_vehicles():
+    try:
+        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, icon_path").order("id", desc=False).execute()
+        return res.data or []
+    except Exception as e:
+        print(f"Vehicles API Error: {e}")
+        return []
 
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
