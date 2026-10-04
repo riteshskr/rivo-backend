@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final Fixed 6.0")
+app = FastAPI(title="Rivo Taxi API - Final Fixed 7.0 Calling Fixed")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -53,25 +53,6 @@ def get_range_by_vehicle(vehicle_type: str, db_range=None):
     if "sedan" in vt: return 12.0
     if "suv" in vt or "xl" in vt: return 15.0
     return 10.0
-
-async def get_city_country_currency(lat: float, lng: float):
-    try:
-        if not GOOGLE_MAPS_API_KEY: return "Unknown", "India", "INR"
-        url = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={lat},{lng}&key={GOOGLE_MAPS_API_KEY}&language=en"
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(url)
-            data = r.json()
-            city = "Unknown"; country = "India"; currency = "INR"
-            if data.get("results"):
-                for comp in data["results"][0]["address_components"]:
-                    if "locality" in comp["types"] or "administrative_area_level_2" in comp["types"]:
-                        if city == "Unknown": city = comp["long_name"]
-                    if "country" in comp["types"]:
-                        country = comp["long_name"]
-                        cmap = {"United Arab Emirates": "AED", "United States": "USD", "United Kingdom": "GBP", "Saudi Arabia": "SAR", "Qatar": "QAR", "Kuwait": "KWD", "Oman": "OMR", "Canada": "CAD", "Australia": "AUD", "Singapore": "SGD", "India": "INR"}
-                        currency = cmap.get(country, "USD")
-            return city, country, currency
-    except: return "Unknown", "India", "INR"
 
 class ConnectionManager:
     def __init__(self):
@@ -140,10 +121,8 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             if d.get('fcm_token'): tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
         if not tokens: return
-        country = ride_data.get('country','India')
         is_parcel = "parcel" in str(ride_data.get('trip_type','')).lower()
         title = "📦 New Parcel!" if is_parcel else f"🔔 New {vehicle_type} Ride!"
-        if "India" in country: title = "📦 नई Parcel आई है!" if is_parcel else f"🔔 नई {vehicle_type} Ride आई है!"
         body = f"{ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:40]}"
         android_config = messaging.AndroidConfig(priority='high', notification=messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert'))
         msg = messaging.MulticastMessage(notification=messaging.Notification(title=title, body=body), data={'vehicle_type': v_type, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert'}, tokens=tokens, android=android_config)
@@ -163,13 +142,20 @@ class DriverLoginRequest(BaseModel):
 class OtpVerifyRequest(BaseModel): otp: str
 class DriverLocationRequest(BaseModel): lat: Optional[float]=None; lng: Optional[float]=None; latitude: Optional[float]=None; longitude: Optional[float]=None
 
-# 🔥 FINAL FIXED TOKEN FUNCTION
+# 🔥 FIXED TOKEN FUNCTION - CALLING FIX
 def generate_stringee_token(user_id: str, ride_id: str=""):
-    if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET: return None, None
-    clean_id = str(user_id).replace("+","").replace(" ","_").replace("-","_").strip()
+    if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET:
+        return None, None
+    raw = str(user_id).strip()
+    # Stringee ID में सिर्फ alphanumeric और _ allowed है
+    clean_id = raw.replace(" ", "_").replace("+", "").replace("-", "_").lower()
+    clean_id = "".join(c for c in clean_id if c.isalnum() or c == "_")
+    if len(clean_id) < 3:
+        clean_id = f"user_{clean_id}_{uuid.uuid4().hex[:4]}"
+
     now = int(time.time())
     jti = f"{STRINGEE_API_KEY_SID}-{now}-{clean_id}-{ride_id}-{uuid.uuid4().hex[:6]}"
-    payload = {"jti": jti, "iss": STRINGEE_API_KEY_SID, "exp": now+86400, "userId": clean_id, "icd": True, "rest_api": True}
+    payload = {"jti": jti, "iss": STRINGEE_API_KEY_SID, "exp": now+86400*7, "userId": clean_id, "icd": True, "rest_api": True}
     token = jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256", headers={"cty": "stringee-api;v=1"})
     return token, clean_id
 
@@ -200,14 +186,22 @@ def driver_login(payload: DriverLoginRequest):
 
 @app.get("/maps/directions")
 async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)):
-    if not GOOGLE_MAPS_API_KEY: raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not set")
-    url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={dest}&key={GOOGLE_MAPS_API_KEY}&language=en&overview=full"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url); data = r.json()
-        if data.get("status") == "OK":
-            route = data["routes"][0]; leg = route["legs"][0]
-            return {"points": route["overview_polyline"]["points"], "distance_text": leg["distance"]["text"], "distance_value": leg["distance"]["value"], "duration_text": leg["duration"]["text"]}
-        else: raise HTTPException(status_code=400, detail=f"Google Error: {data.get('status')}")
+    try:
+        if not GOOGLE_MAPS_API_KEY:
+            raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not set")
+        url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={dest}&key={GOOGLE_MAPS_API_KEY}&language=en&overview=full"
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url)
+            data = r.json()
+            if data.get("status") == "OK":
+                route = data["routes"][0]
+                leg = route["legs"][0]
+                return {"points": route["overview_polyline"]["points"], "distance_text": leg["distance"]["text"], "distance_value": leg["distance"]["value"], "duration_text": leg["duration"]["text"]}
+            else:
+                err = data.get("error_message", "")
+                raise HTTPException(status_code=400, detail=f"Google: {data.get('status')} - {err}")
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/drivers/{driver_id}/location")
 def update_driver_location(driver_id: str, payload: DriverLocationRequest):
@@ -265,33 +259,76 @@ def get_vehicles():
     try: res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, icon_path").order("id", desc=False).execute(); return res.data or []
     except: return []
 
+# 🔥 FIXED - अब DB में भी Token Update होगा
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
     if not res.data: raise HTTPException(status_code=404, detail="Ride not found")
     ride = res.data[0]
-    # हर बार Token Refresh
     try:
-        new_rider_token, _ = generate_stringee_token(ride.get("stringee_user_id") or ride.get("user_id"), str(ride_id))
+        # Rider token refresh
+        rider_base_id = ride.get("stringee_user_id") or ride.get("user_id")
+        new_rider_token, rider_cid = generate_stringee_token(rider_base_id, str(ride_id))
+
+        update_data = {"stringee_token": new_rider_token, "stringee_user_id": rider_cid}
         ride["stringee_token"] = new_rider_token
+        ride["stringee_user_id"] = rider_cid
+
         if ride.get("driver_id"):
-            new_driver_token, _ = generate_stringee_token(ride.get("driver_stringee_user_id") or ride.get("driver_id"), str(ride_id))
+            driver_base_id = ride.get("driver_stringee_user_id") or ride.get("driver_id")
+            new_driver_token, driver_cid = generate_stringee_token(driver_base_id, str(ride_id))
+            update_data["driver_stringee_token"] = new_driver_token
+            update_data["driver_stringee_user_id"] = driver_cid
             ride["driver_stringee_token"] = new_driver_token
-    except: pass
+            ride["driver_stringee_user_id"] = driver_cid
+
+        # DB में भी update करो - ये Main Fix है
+        supabase.table("rides").update(update_data).eq("id", ride_id).execute()
+
+    except Exception as e:
+        print(f"Token refresh error: {e}")
     return ride
 
 @app.get("/rides/ongoing/{user_id}")
 def get_ongoing(user_id: str):
     res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived"]).order("id", desc=True).limit(1).execute()
     if not res.data: return None
-    return res.data[0]
+    ride = res.data[0]
+    # Ongoing में भी fresh token दो
+    try:
+        new_rider_token, rider_cid = generate_stringee_token(ride.get("stringee_user_id") or ride.get("user_id"), str(ride["id"]))
+        ride["stringee_token"] = new_rider_token
+        ride["stringee_user_id"] = rider_cid
+        if ride.get("driver_id"):
+            new_driver_token, driver_cid = generate_stringee_token(ride.get("driver_stringee_user_id") or ride.get("driver_id"), str(ride["id"]))
+            ride["driver_stringee_token"] = new_driver_token
+            ride["driver_stringee_user_id"] = driver_cid
+    except: pass
+    return ride
 
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
-    city, country, currency = await get_city_country_currency(payload.pickup_lat, payload.pickup_lng)
     token, clean_id = generate_stringee_token(user_id, "new")
     final_trip = "parcel" if "parcel" in str(payload.trip_type).lower() else "ride"
-    ride_data = {"user_id":user_id,"pickup_lat":payload.pickup_lat,"pickup_lng":payload.pickup_lng,"drop_lat":payload.drop_lat,"drop_lng":payload.drop_lng,"pickup_address":payload.pickup_address,"drop_address":payload.drop_address,"vehicle_type":payload.vehicle_type,"distance":payload.distance,"fare":payload.fare,"trip_type": final_trip,"status":"pending","otp":payload.otp,"city": city, "country": country, "currency": currency,"created_at":datetime.now().isoformat(),"stringee_token":token,"stringee_user_id":clean_id}
+    ride_data = {
+        "user_id": user_id,
+        "pickup_lat": payload.pickup_lat,
+        "pickup_lng": payload.pickup_lng,
+        "drop_lat": payload.drop_lat,
+        "drop_lng": payload.drop_lng,
+        "pickup_address": payload.pickup_address,
+        "drop_address": payload.drop_address,
+        "vehicle_type": payload.vehicle_type,
+        "distance": payload.distance,
+        "fare": payload.fare,
+        "trip_type": final_trip,
+        "status": "pending",
+        "otp": payload.otp,
+        "city": "", "country": "", "currency": "INR",
+        "created_at": datetime.now().isoformat(),
+        "stringee_token": token,
+        "stringee_user_id": clean_id
+    }
     res = supabase.table("rides").insert(ride_data).execute()
     if not res.data: raise HTTPException(status_code=500, detail="Failed")
     new_ride = res.data[0]
@@ -309,7 +346,6 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     if not ride_res.data: raise HTTPException(status_code=404, detail="Ride not found")
     old_rider_user_id = ride_res.data[0].get("stringee_user_id") or ride_res.data[0].get("user_id")
 
-    # हर Ride पर नया Token
     new_rider_token, rider_clean_id = generate_stringee_token(old_rider_user_id, str(ride_id))
     new_driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
 
@@ -329,17 +365,16 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
     if not updated.data: raise HTTPException(status_code=409, detail="Already taken")
     await manager.broadcast_ride_taken(ride_id)
-
-    # 🔥 App के लिए stringee_token नाम से भी भेज रहे हैं ताकि null error न आए
     return {
         "success":True,
         "ride":updated.data[0],
-        "stringee_token": new_driver_token, # <-- Driver App यही पढ़ता है
+        "stringee_token": new_driver_token,
         "driver_token": new_driver_token,
         "rider_token": new_rider_token,
         "driver_user_id": driver_clean_id,
         "rider_user_id": rider_clean_id
     }
+
 @app.post("/rides/{ride_id}/verify-otp")
 def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
     res = supabase.table("rides").select("id,otp,status").eq("id", ride_id).execute()
@@ -364,8 +399,14 @@ def get_active_ride(driver_id: str):
     if res.data:
         ride = res.data[0]
         try:
-            ride["stringee_token"], _ = generate_stringee_token(ride.get("stringee_user_id") or ride.get("user_id"), str(ride["id"]))
-            ride["driver_stringee_token"], _ = generate_stringee_token(ride.get("driver_stringee_user_id") or ride.get("driver_id"), str(ride["id"]))
+            new_r_token, r_cid = generate_stringee_token(ride.get("stringee_user_id") or ride.get("user_id"), str(ride["id"]))
+            new_d_token, d_cid = generate_stringee_token(ride.get("driver_stringee_user_id") or ride.get("driver_id"), str(ride["id"]))
+            ride["stringee_token"] = new_r_token
+            ride["stringee_user_id"] = r_cid
+            ride["driver_stringee_token"] = new_d_token
+            ride["driver_stringee_user_id"] = d_cid
+            # DB भी update
+            supabase.table("rides").update({"stringee_token": new_r_token, "stringee_user_id": r_cid, "driver_stringee_token": new_d_token, "driver_stringee_user_id": d_cid}).eq("id", ride["id"]).execute()
         except: pass
         return {"active": True, "ride": ride}
     return {"active": False, "ride": None}
@@ -414,5 +455,5 @@ async def cancel_ride(ride_id: int, user_id: str = Query(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-def root(): return {"status":"Rivo API Final 6.0 - Per Ride Token Fixed"}
+def root(): return {"status":"Rivo API 7.0 - Stringee Calling Fixed"}
 
