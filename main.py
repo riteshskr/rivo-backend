@@ -399,6 +399,27 @@ async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = 
     except WebSocketDisconnect:
         manager.disconnect_driver(ws)
 
+
+@app.put("/rides/{ride_id}/cancel")
+def cancel_ride(ride_id: int, user_id: str = Query(None)):
+    try:
+        print(f"CANCEL REQUEST: ride_id={ride_id}")
+
+        updated = supabase.table("rides").update({
+            "status": "cancelled",
+            "cancelled_at": datetime.now().isoformat()
+        }).eq("id", ride_id).execute()
+
+        if not updated.data:
+            raise HTTPException(status_code=404, detail="Ride not found")
+
+        print(f"Ride {ride_id} -> cancelled")
+        return {"success": True, "ride": updated.data[0]}
+
+    except Exception as e:
+        print(f"CANCEL ERROR: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 def root():
     return {"status":"Rivo API Fixed - Driver Login ID+Password Working", "login_examples": ["car1 / 123", "9875262306 / 123"]}
