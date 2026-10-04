@@ -308,15 +308,38 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     ride_res = supabase.table("rides").select("user_id,stringee_user_id").eq("id", ride_id).execute()
     if not ride_res.data: raise HTTPException(status_code=404, detail="Ride not found")
     old_rider_user_id = ride_res.data[0].get("stringee_user_id") or ride_res.data[0].get("user_id")
+
+    # हर Ride पर नया Token
     new_rider_token, rider_clean_id = generate_stringee_token(old_rider_user_id, str(ride_id))
     new_driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
-    print(f"✅ ACCEPT RIDE {ride_id} -> RIDER {rider_clean_id} + DRIVER {driver_clean_id}")
-    ride_update = {"driver_id": driver["id"],"status": "accepted","driver_name": driver.get("name"),"driver_phone": driver.get("phone"),"vehicle_number": driver.get("vehicle_number"),"vehicle_type": driver.get("vehicle_type"),"stringee_token": new_rider_token,"stringee_user_id": rider_clean_id,"driver_stringee_token": new_driver_token,"driver_stringee_user_id": driver_clean_id,"accepted_at": datetime.now().isoformat()}
+
+    ride_update = {
+        "driver_id": driver["id"],
+        "status": "accepted",
+        "driver_name": driver.get("name"),
+        "driver_phone": driver.get("phone"),
+        "vehicle_number": driver.get("vehicle_number"),
+        "vehicle_type": driver.get("vehicle_type"),
+        "stringee_token": new_rider_token,
+        "stringee_user_id": rider_clean_id,
+        "driver_stringee_token": new_driver_token,
+        "driver_stringee_user_id": driver_clean_id,
+        "accepted_at": datetime.now().isoformat()
+    }
     updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
     if not updated.data: raise HTTPException(status_code=409, detail="Already taken")
     await manager.broadcast_ride_taken(ride_id)
-    return {"success":True, "ride":updated.data[0], "driver_token":new_driver_token, "rider_token": new_rider_token, "driver_user_id": driver_clean_id, "rider_user_id": rider_clean_id}
 
+    # 🔥 App के लिए stringee_token नाम से भी भेज रहे हैं ताकि null error न आए
+    return {
+        "success":True,
+        "ride":updated.data[0],
+        "stringee_token": new_driver_token, # <-- Driver App यही पढ़ता है
+        "driver_token": new_driver_token,
+        "rider_token": new_rider_token,
+        "driver_user_id": driver_clean_id,
+        "rider_user_id": rider_clean_id
+    }
 @app.post("/rides/{ride_id}/verify-otp")
 def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
     res = supabase.table("rides").select("id,otp,status").eq("id", ride_id).execute()
