@@ -168,23 +168,41 @@ def generate_stringee_token(user_id: str, ride_id: str=""):
 # 🔥 ARCHIVE SYSTEM - FINAL
 def archive_and_delete_ride(ride_id: int):
     try:
-        res = supabase.table("rides").select("*").eq("id", ride_id).execute()
+        # Thread के अंदर नया client बनाना ज्यादा safe है
+        from supabase import create_client
+        local_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+        res = local_supabase.table("rides").select("*").eq("id", ride_id).execute()
         if not res.data:
             print(f"Archive Fail: Ride {ride_id} not found")
             return
+
         ride_data = res.data[0]
         original_id = ride_data.get('id')
+
         archive_data = ride_data.copy()
-        archive_data['archived_at'] = datetime.now().isoformat()
         archive_data['original_ride_id'] = original_id
-        # id conflict से बचने के लिए अगर archive में id unique है तो ये line खोल दो
-        # archive_data.pop('id', None)
-        supabase.table("rides_archive").insert(archive_data).execute()
-        print(f"✅ Archived: {original_id}")
-        supabase.table("rides").delete().eq("id", original_id).execute()
-        print(f"🗑️ Deleted from rides: {original_id}")
+        archive_data['archived_at'] = datetime.now().isoformat()
+
+        # 🔥 ये सबसे जरूरी है - पुरानी id हटाओ
+        archive_data.pop('id', None)
+        print(f"Trying to archive ride {original_id}...")
+        ins = local_supabase.table("rides_archive").insert(archive_data).execute()
+
+        if ins.data:
+            print(f"✅ Archived Success: {original_id} -> archive id {ins.data[0].get('id')}")
+            # अब rides से हटाओ
+            local_supabase.table("rides").delete().eq("id", original_id).execute()
+            print(f"🗑 Deleted from rides: {original_id}")
+        else:
+            print(f"❌ Archive Insert returned nil for {original_id}: {ins}")
+
     except Exception as e:
-        print(f"Archive Error {ride_id}: {e}")
+        print(f"❌ Archive Error {ride_id}: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 
 @app.post("/drivers/login")
 def driver_login(payload: DriverLoginRequest):
