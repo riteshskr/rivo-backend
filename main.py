@@ -1,4 +1,4 @@
-import os, json, time, jwt, uuid, math, httpx, asyncio
+import os, json, time, jwt, uuid, math, httpx, asyncio, threading
 from datetime import datetime
 from typing import Optional, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final Fixed 7.0 Calling Fixed")
+app = FastAPI(title="Rivo Taxi API - Final 8.0 Archive Fixed")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -72,6 +72,9 @@ class ConnectionManager:
     async def connect_driver(self, ws: WebSocket, vehicle_type: str = "", lat: float = None, lng: float = None, driver_range: float = None, driver_id: str = ""):
         await ws.accept()
         self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
+        # same driver_id का पुराना connection हटाओ
+        if driver_id:
+            self.driver_connections = [d for d in self.driver_connections if d.get("driver_id")!= driver_id]
         self.driver_connections.append({"ws": ws, "vehicle_type": vehicle_type.lower().strip(), "lat": lat, "lng": lng, "range": driver_range, "driver_id": driver_id})
     def disconnect_driver(self, ws: WebSocket):
         self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
@@ -125,8 +128,14 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         title = "📦 New Parcel!" if is_parcel else f"🔔 New {vehicle_type} Ride!"
         body = f"{ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:40]}"
         android_config = messaging.AndroidConfig(priority='high', notification=messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert'))
-        msg = messaging.MulticastMessage(notification=messaging.Notification(title=title, body=body), data={'vehicle_type': v_type, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert'}, tokens=tokens, android=android_config)
+        # 🔥 FIX: पूरी ride data FCM में
+        safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
+        msg = messaging.MulticastMessage(
+            notification=messaging.Notification(title=title, body=body),
+            data={'vehicle_type': v_type, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert', 'ride_json': json.dumps(safe_ride, default=str)},
+            tokens=tokens, android=android_config)
         messaging.send_each_for_multicast(msg)
+        print(f"FCM Sent to {len(tokens)} drivers")
     except Exception as e: print(f"FCM Error {e}")
 
 class RideCreateRequest(BaseModel):
@@ -142,22 +151,40 @@ class DriverLoginRequest(BaseModel):
 class OtpVerifyRequest(BaseModel): otp: str
 class DriverLocationRequest(BaseModel): lat: Optional[float]=None; lng: Optional[float]=None; latitude: Optional[float]=None; longitude: Optional[float]=None
 
-# 🔥 FIXED TOKEN FUNCTION - CALLING FIX
 def generate_stringee_token(user_id: str, ride_id: str=""):
     if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET:
         return None, None
     raw = str(user_id).strip()
-    # Stringee ID में सिर्फ alphanumeric और _ allowed है
     clean_id = raw.replace(" ", "_").replace("+", "").replace("-", "_").lower()
     clean_id = "".join(c for c in clean_id if c.isalnum() or c == "_")
     if len(clean_id) < 3:
         clean_id = f"user_{clean_id}_{uuid.uuid4().hex[:4]}"
-
     now = int(time.time())
     jti = f"{STRINGEE_API_KEY_SID}-{now}-{clean_id}-{ride_id}-{uuid.uuid4().hex[:6]}"
     payload = {"jti": jti, "iss": STRINGEE_API_KEY_SID, "exp": now+86400*7, "userId": clean_id, "icd": True, "rest_api": True}
     token = jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256", headers={"cty": "stringee-api;v=1"})
     return token, clean_id
+
+# 🔥 ARCHIVE SYSTEM - FINAL
+def archive_and_delete_ride(ride_id: int):
+    try:
+        res = supabase.table("rides").select("*").eq("id", ride_id).execute()
+        if not res.data:
+            print(f"Archive Fail: Ride {ride_id} not found")
+            return
+        ride_data = res.data[0]
+        original_id = ride_data.get('id')
+        archive_data = ride_data.copy()
+        archive_data['archived_at'] = datetime.now().isoformat()
+        archive_data['original_ride_id'] = original_id
+        # id conflict से बचने के लिए अगर archive में id unique है तो ये line खोल दो
+        # archive_data.pop('id', None)
+        supabase.table("rides_archive").insert(archive_data).execute()
+        print(f"✅ Archived: {original_id}")
+        supabase.table("rides").delete().eq("id", original_id).execute()
+        print(f"🗑️ Deleted from rides: {original_id}")
+    except Exception as e:
+        print(f"Archive Error {ride_id}: {e}")
 
 @app.post("/drivers/login")
 def driver_login(payload: DriverLoginRequest):
@@ -213,6 +240,11 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
     if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
     real_id = d_res.data[0]["id"]
     supabase.table("drivers").update({"current_latitude": lat, "current_longitude": lng, "last_seen": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "is_online": True}).eq("id", real_id).execute()
+    # 🔥 FIX: WS connections की location भी update
+    for d in manager.driver_connections:
+        if d.get("driver_id") == driver_id or d.get("driver_id") == real_id:
+            d["lat"] = lat
+            d["lng"] = lng
     try: supabase.table("rides").update({"driver_lat": lat, "driver_lng": lng}).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
     except: pass
     return {"success": True}
@@ -259,21 +291,17 @@ def get_vehicles():
     try: res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, icon_path").order("id", desc=False).execute(); return res.data or []
     except: return []
 
-# 🔥 FIXED - अब DB में भी Token Update होगा
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
     if not res.data: raise HTTPException(status_code=404, detail="Ride not found")
     ride = res.data[0]
     try:
-        # Rider token refresh
         rider_base_id = ride.get("stringee_user_id") or ride.get("user_id")
         new_rider_token, rider_cid = generate_stringee_token(rider_base_id, str(ride_id))
-
         update_data = {"stringee_token": new_rider_token, "stringee_user_id": rider_cid}
         ride["stringee_token"] = new_rider_token
         ride["stringee_user_id"] = rider_cid
-
         if ride.get("driver_id"):
             driver_base_id = ride.get("driver_stringee_user_id") or ride.get("driver_id")
             new_driver_token, driver_cid = generate_stringee_token(driver_base_id, str(ride_id))
@@ -281,10 +309,7 @@ def get_ride(ride_id: int):
             update_data["driver_stringee_user_id"] = driver_cid
             ride["driver_stringee_token"] = new_driver_token
             ride["driver_stringee_user_id"] = driver_cid
-
-        # DB में भी update करो - ये Main Fix है
         supabase.table("rides").update(update_data).eq("id", ride_id).execute()
-
     except Exception as e:
         print(f"Token refresh error: {e}")
     return ride
@@ -294,7 +319,6 @@ def get_ongoing(user_id: str):
     res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived"]).order("id", desc=True).limit(1).execute()
     if not res.data: return None
     ride = res.data[0]
-    # Ongoing में भी fresh token दो
     try:
         new_rider_token, rider_cid = generate_stringee_token(ride.get("stringee_user_id") or ride.get("user_id"), str(ride["id"]))
         ride["stringee_token"] = new_rider_token
@@ -345,10 +369,8 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     ride_res = supabase.table("rides").select("user_id,stringee_user_id").eq("id", ride_id).execute()
     if not ride_res.data: raise HTTPException(status_code=404, detail="Ride not found")
     old_rider_user_id = ride_res.data[0].get("stringee_user_id") or ride_res.data[0].get("user_id")
-
     new_rider_token, rider_clean_id = generate_stringee_token(old_rider_user_id, str(ride_id))
     new_driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
-
     ride_update = {
         "driver_id": driver["id"],
         "status": "accepted",
@@ -388,7 +410,8 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int):
     supabase.table("rides").update({"status":"completed", "completed_at": datetime.now().isoformat()}).eq("id",ride_id).execute()
-    return {"success":True}
+    threading.Thread(target=archive_and_delete_ride, args=(ride_id,)).start()
+    return {"success":True, "archived": True}
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
@@ -405,7 +428,6 @@ def get_active_ride(driver_id: str):
             ride["stringee_user_id"] = r_cid
             ride["driver_stringee_token"] = new_d_token
             ride["driver_stringee_user_id"] = d_cid
-            # DB भी update
             supabase.table("rides").update({"stringee_token": new_r_token, "stringee_user_id": r_cid, "driver_stringee_token": new_d_token, "driver_stringee_user_id": d_cid}).eq("id", ride["id"]).execute()
         except: pass
         return {"active": True, "ride": ride}
@@ -449,11 +471,20 @@ async def cancel_ride(ride_id: int, user_id: str = Query(None)):
                 try: await driver["ws"].send_text(json.dumps({"type": "ride_cancelled","ride_id": ride_id}))
                 except: pass
         except: pass
-        return {"success": True, "ride": updated.data[0]}
+        threading.Thread(target=archive_and_delete_ride, args=(ride_id,)).start()
+        return {"success": True, "ride": updated.data[0], "archived": True}
     except HTTPException: raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
-def root(): return {"status":"Rivo API 7.0 - Stringee Calling Fixed"}
+def root(): return {"status":"Rivo API 8.0 - Archive System Active - rides table only pending/started"}
+
+@app.get("/admin/archived")
+def get_archived():
+    try:
+        res = supabase.table("rides_archive").select("*").order("id", desc=True).limit(100).execute()
+        return res.data
+    except Exception as e:
+        return {"error": str(e)}
 
