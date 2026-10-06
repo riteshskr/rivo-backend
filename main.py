@@ -1,5 +1,5 @@
-import os, json, time, jwt, uuid, math, httpx
-from datetime import datetime
+import os, json, time, jwt, uuid, math, httpx, asyncio
+from datetime import datetime, timedelta
 from typing import Optional, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 10.0 - Filter + Sound + Archive")
+app = FastAPI(title="Rivo Taxi API - Final 12.0 - Scheduled Timeout + Archive")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -108,72 +108,32 @@ manager = ConnectionManager()
 
 def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
     try:
-        if not firebase_admin._apps: 
-            return
+        if not firebase_admin._apps: return
         v_type = vehicle_type.strip().lower()
-        # PENDING LIST WALA SAME FILTER
         all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range").eq("is_online", True).neq("fcm_token", "").execute().data or []
-        tokens = []
-        p_lat = float(ride_data.get('pickup_lat', 0))
-        p_lng = float(ride_data.get('pickup_lng', 0))
+        tokens = []; p_lat = float(ride_data.get('pickup_lat', 0)); p_lng = float(ride_data.get('pickup_lng', 0))
         for d in all_drivers:
             d_v = str(d.get('vehicle_type','')).lower().strip()
-            if d_v != v_type: 
-                continue
-            d_lat = d.get('current_latitude')
-            d_lng = d.get('current_longitude')
+            if d_v!= v_type: continue
+            d_lat = d.get('current_latitude'); d_lng = d.get('current_longitude')
             if d_lat and d_lng:
                 drange = get_range_by_vehicle(d_v, d.get('range'))
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if dist > float(drange): 
-                    continue
-            if d.get('fcm_token'): 
-                tokens.append(d['fcm_token'])
+                if dist > float(drange): continue
+            if d.get('fcm_token'): tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
-        if not tokens: 
-            print("No driver in range for FCM")
-            return
+        if not tokens: return
         is_parcel = "parcel" in str(ride_data.get('trip_type','')).lower()
         title = "📦 New Parcel Request!" if is_parcel else f"🔔 New {vehicle_type} Ride Nearby!"
         body = f"{ride_data.get('pickup_address','')[:45]} -> {ride_data.get('drop_address','')[:30]} | ₹{ride_data.get('fare','')}"
-        android_notif = messaging.AndroidNotification(
-            channel_id='ride_channel_v5',
-            priority='max',
-            visibility='public',
-            sound='alert',
-            default_sound=False
-        )
-        android_config = messaging.AndroidConfig(
-            priority='high',
-            notification=android_notif
-        )
-        apns_config = messaging.APNSConfig(
-            payload=messaging.APNSPayload(
-                aps=messaging.Aps(sound='default', badge=1)
-            )
-        )
-        safe_ride = {k: v for k, v in ride_data.items() if k != 'otp'}
-        msg = messaging.MulticastMessage(
-            notification=messaging.Notification(title=title, body=body),
-            data={
-                'vehicle_type': v_type, 
-                'ride_id': str(ride_data.get('id','')), 
-                'type': 'new_ride_alert', 
-                'fare': str(ride_data.get('fare','')),
-                'click_action': 'FLUTTER_NOTIFICATION_CLICK',
-                'sound': 'alert',
-                'ride_json': json.dumps(safe_ride, default=str)
-            },
-            tokens=tokens, 
-            android=android_config,
-            apns=apns_config
-        )
+        android_notif = messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert', default_sound=False)
+        android_config = messaging.AndroidConfig(priority='high', notification=android_notif)
+        apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1)))
+        safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
+        msg = messaging.MulticastMessage(notification=messaging.Notification(title=title, body=body), data={'vehicle_type': v_type, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert', 'fare': str(ride_data.get('fare','')), 'click_action': 'FLUTTER_NOTIFICATION_CLICK', 'sound': 'alert', 'ride_json': json.dumps(safe_ride, default=str)}, tokens=tokens, android=android_config, apns=apns_config)
         messaging.send_each_for_multicast(msg)
-        print(f"✅ FCM Sent to {len(tokens)} drivers - Type:{v_type} with Sound")
-    except Exception as e: 
-        print(f"FCM Error {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"✅ FCM Sent to {len(tokens)} drivers - Type:{v_type}")
+    except Exception as e: print(f"FCM Error {e}")
 
 class RideCreateRequest(BaseModel):
     pickup_lat: float; pickup_lng: float; drop_lat: float; drop_lng: float
@@ -189,20 +149,17 @@ class OtpVerifyRequest(BaseModel): otp: str
 class DriverLocationRequest(BaseModel): lat: Optional[float]=None; lng: Optional[float]=None; latitude: Optional[float]=None; longitude: Optional[float]=None
 
 def generate_stringee_token(user_id: str, ride_id: str=""):
-    if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET:
-        return None, None
+    if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET: return None, None
     raw = str(user_id).strip()
     clean_id = raw.replace(" ", "_").replace("+", "").replace("-", "_").lower()
     clean_id = "".join(c for c in clean_id if c.isalnum() or c == "_")
-    if len(clean_id) < 3:
-        clean_id = f"user_{clean_id}_{uuid.uuid4().hex[:4]}"
+    if len(clean_id) < 3: clean_id = f"user_{clean_id}_{uuid.uuid4().hex[:4]}"
     now = int(time.time())
     jti = f"{STRINGEE_API_KEY_SID}-{now}-{clean_id}-{ride_id}-{uuid.uuid4().hex[:6]}"
     payload = {"jti": jti, "iss": STRINGEE_API_KEY_SID, "exp": now+86400*7, "userId": clean_id, "icd": True, "rest_api": True}
     token = jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256", headers={"cty": "stringee-api;v=1"})
     return token, clean_id
 
-# ARCHIVE SYSTEM - FINAL FOR 3 STATUS (completed, cancelled, timeout)
 def archive_and_delete_ride(ride_id: int):
     try:
         from supabase import create_client
@@ -217,19 +174,74 @@ def archive_and_delete_ride(ride_id: int):
         ride_data['original_ride_id'] = original_id
         ride_data['archived_at'] = datetime.now().isoformat()
         local_supabase.table("rides_archive").insert(ride_data).execute()
-        local_supabase.table("rides").delete().eq("id", original_id).execute()
-        print(f"✅ ARCHIVED {original_id} - {ride_data.get('status')}")
+        print(f"✅ Inserted to archive: {original_id} - {ride_data.get('status')}")
+        try: local_supabase.table("rides").delete().eq("id", int(original_id)).execute()
+        except: pass
+        try: supabase.table("rides").delete().eq("id", int(original_id)).execute()
+        except: pass
+        print(f"🗑 Deleted from rides: {original_id}")
     except Exception as e:
         print(f"❌ Archive Error {ride_id}: {e}")
-        import traceback
-        traceback.print_exc()
 
-# --- RIDE ENDPOINTS - ALL ARCHIVE ---
+# 🔥 BACKEND TIMEOUT - SCHEDULED TIME LOGIC
+TIMEOUT_MINUTES = 10
+
+async def auto_timeout_checker():
+    print(f"⏰ Auto Timeout Checker Started - {TIMEOUT_MINUTES} min (Scheduled Logic)")
+    while True:
+        try:
+            now = datetime.now()
+            pending_res = supabase.table("rides").select("id,created_at,scheduled_time").eq("status", "pending").limit(50).execute()
+            if pending_res.data:
+                for r in pending_res.data:
+                    ride_id = r['id']
+                    created_at_str = r.get('created_at')
+                    scheduled_str = r.get('scheduled_time')
+                    should_timeout = False
+
+                    # CASE 1: Normal Ride (scheduled_time null)
+                    if not scheduled_str or str(scheduled_str).strip() in ["", "null", "None"]:
+                        if created_at_str:
+                            try:
+                                created_dt = datetime.fromisoformat(str(created_at_str).replace('Z',''))
+                                if created_dt.tzinfo: created_dt = created_dt.replace(tzinfo=None)
+                                if (now - created_dt).total_seconds() / 60 >= TIMEOUT_MINUTES:
+                                    should_timeout = True
+                            except: pass
+                    # CASE 2: Scheduled Ride
+                    else:
+                        try:
+                            sched_dt = datetime.fromisoformat(str(scheduled_str).replace('Z',''))
+                            if sched_dt.tzinfo: sched_dt = sched_dt.replace(tzinfo=None)
+                            timeout_at = sched_dt - timedelta(minutes=TIMEOUT_MINUTES)
+                            if now >= timeout_at:
+                                should_timeout = True
+                                print(f"⏰ Scheduled ride {ride_id} - Scheduled: {sched_dt}, Timeout At: {timeout_at}, Now: {now}")
+                        except Exception as e:
+                            print(f"Scheduled parse error {ride_id}: {e}")
+
+                    if should_timeout:
+                        try:
+                            supabase.table("rides").update({"status": "timeout"}).eq("id", ride_id).execute()
+                            archive_and_delete_ride(ride_id)
+                            await manager.broadcast_ride_taken(ride_id)
+                            print(f"⏰ Auto-Timeout & Archived: {ride_id}")
+                        except Exception as e:
+                            print(f"Timeout error {ride_id}: {e}")
+        except Exception as e:
+            print(f"Timeout checker error: {e}")
+        await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(auto_timeout_checker())
+    print("✅ Rivo API Started with Auto Timeout (Scheduled Logic)")
+
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
     supabase.table("rides").update({"status":"completed", "completed_at": datetime.now().isoformat()}).eq("id",ride_id).execute()
     background_tasks.add_task(archive_and_delete_ride, ride_id)
-    return {"success":True, "archived": "in_progress"}
+    return {"success":True}
 
 @app.put("/rides/{ride_id}/cancel")
 async def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
@@ -246,7 +258,7 @@ async def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: 
 def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
     supabase.table("rides").update({"status":"timeout"}).eq("id", ride_id).execute()
     background_tasks.add_task(archive_and_delete_ride, ride_id)
-    return {"success": True, "archived": True}
+    return {"success": True}
 
 @app.post("/drivers/login")
 def driver_login(payload: DriverLoginRequest):
@@ -276,19 +288,15 @@ def driver_login(payload: DriverLoginRequest):
 @app.get("/maps/directions")
 async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)):
     try:
-        if not GOOGLE_MAPS_API_KEY:
-            raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not set")
+        if not GOOGLE_MAPS_API_KEY: raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not set")
         url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={dest}&key={GOOGLE_MAPS_API_KEY}&language=en&overview=full"
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(url)
             data = r.json()
             if data.get("status") == "OK":
-                route = data["routes"][0]
-                leg = route["legs"][0]
+                route = data["routes"][0]; leg = route["legs"][0]
                 return {"points": route["overview_polyline"]["points"], "distance_text": leg["distance"]["text"], "distance_value": leg["distance"]["value"], "duration_text": leg["duration"]["text"]}
-            else:
-                err = data.get("error_message", "")
-                raise HTTPException(status_code=400, detail=f"Google: {data.get('status')} - {err}")
+            else: raise HTTPException(status_code=400, detail=f"Google: {data.get('status')}")
     except HTTPException: raise
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
@@ -303,9 +311,7 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
     real_id = d_res.data[0]["id"]
     supabase.table("drivers").update({"current_latitude": lat, "current_longitude": lng, "last_seen": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "is_online": True}).eq("id", real_id).execute()
     for d in manager.driver_connections:
-        if d.get("driver_id") == driver_id or d.get("driver_id") == real_id:
-            d["lat"] = lat
-            d["lng"] = lng
+        if d.get("driver_id") == driver_id or d.get("driver_id") == real_id: d["lat"] = lat; d["lng"] = lng
     try: supabase.table("rides").update({"driver_lat": lat, "driver_lng": lng}).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
     except: pass
     return {"success": True}
@@ -344,8 +350,7 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
         filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
         return filtered
     except HTTPException: raise
-    except Exception as e:
-        print(f"Pending Error: {e}"); return []
+    except Exception as e: print(f"Pending Error: {e}"); return []
 
 @app.get("/vehicles")
 def get_vehicles():
@@ -361,58 +366,37 @@ def get_ride(ride_id: int):
         rider_base_id = ride.get("stringee_user_id") or ride.get("user_id")
         new_rider_token, rider_cid = generate_stringee_token(rider_base_id, str(ride_id))
         update_data = {"stringee_token": new_rider_token, "stringee_user_id": rider_cid}
-        ride["stringee_token"] = new_rider_token
-        ride["stringee_user_id"] = rider_cid
+        ride["stringee_token"] = new_rider_token; ride["stringee_user_id"] = rider_cid
         if ride.get("driver_id"):
             driver_base_id = ride.get("driver_stringee_user_id") or ride.get("driver_id")
             new_driver_token, driver_cid = generate_stringee_token(driver_base_id, str(ride_id))
-            update_data["driver_stringee_token"] = new_driver_token
-            update_data["driver_stringee_user_id"] = driver_cid
-            ride["driver_stringee_token"] = new_driver_token
-            ride["driver_stringee_user_id"] = driver_cid
+            update_data["driver_stringee_token"] = new_driver_token; update_data["driver_stringee_user_id"] = driver_cid
+            ride["driver_stringee_token"] = new_driver_token; ride["driver_stringee_user_id"] = driver_cid
         supabase.table("rides").update(update_data).eq("id", ride_id).execute()
-    except Exception as e:
-        print(f"Token refresh error: {e}")
+    except: pass
     return ride
 
 @app.get("/rides/ongoing/{user_id}")
 def get_ongoing(user_id: str):
     res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived"]).order("id", desc=True).limit(1).execute()
     if not res.data: return None
-    ride = res.data[0]
-    try:
-        new_rider_token, rider_cid = generate_stringee_token(ride.get("stringee_user_id") or ride.get("user_id"), str(ride["id"]))
-        ride["stringee_token"] = new_rider_token
-        ride["stringee_user_id"] = rider_cid
-        if ride.get("driver_id"):
-            new_driver_token, driver_cid = generate_stringee_token(ride.get("driver_stringee_user_id") or ride.get("driver_id"), str(ride["id"]))
-            ride["driver_stringee_token"] = new_driver_token
-            ride["driver_stringee_user_id"] = driver_cid
-    except: pass
-    return ride
+    return res.data[0]
 
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     token, clean_id = generate_stringee_token(user_id, "new")
     final_trip = "parcel" if "parcel" in str(payload.trip_type).lower() else "ride"
     ride_data = {
-        "user_id": user_id,
-        "pickup_lat": payload.pickup_lat,
-        "pickup_lng": payload.pickup_lng,
-        "drop_lat": payload.drop_lat,
-        "drop_lng": payload.drop_lng,
-        "pickup_address": payload.pickup_address,
-        "drop_address": payload.drop_address,
-        "vehicle_type": payload.vehicle_type,
-        "distance": payload.distance,
-        "fare": payload.fare,
-        "trip_type": final_trip,
-        "status": "pending",
-        "otp": payload.otp,
+        "user_id": user_id, 
+        "pickup_lat": payload.pickup_lat, "pickup_lng": payload.pickup_lng,
+        "drop_lat": payload.drop_lat, "drop_lng": payload.drop_lng,
+        "pickup_address": payload.pickup_address, "drop_address": payload.drop_address,
+        "vehicle_type": payload.vehicle_type, "distance": payload.distance, "fare": payload.fare,
+        "trip_type": final_trip, "status": "pending", "otp": payload.otp,
         "city": "", "country": "", "currency": "INR",
         "created_at": datetime.now().isoformat(),
-        "stringee_token": token,
-        "stringee_user_id": clean_id
+        "scheduled_time": payload.scheduled_time,
+        "stringee_token": token, "stringee_user_id": clean_id
     }
     res = supabase.table("rides").insert(ride_data).execute()
     if not res.data: raise HTTPException(status_code=500, detail="Failed")
@@ -432,31 +416,11 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     old_rider_user_id = ride_res.data[0].get("stringee_user_id") or ride_res.data[0].get("user_id")
     new_rider_token, rider_clean_id = generate_stringee_token(old_rider_user_id, str(ride_id))
     new_driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
-    ride_update = {
-        "driver_id": driver["id"],
-        "status": "accepted",
-        "driver_name": driver.get("name"),
-        "driver_phone": driver.get("phone"),
-        "vehicle_number": driver.get("vehicle_number"),
-        "vehicle_type": driver.get("vehicle_type"),
-        "stringee_token": new_rider_token,
-        "stringee_user_id": rider_clean_id,
-        "driver_stringee_token": new_driver_token,
-        "driver_stringee_user_id": driver_clean_id,
-        "accepted_at": datetime.now().isoformat()
-    }
+    ride_update = {"driver_id": driver["id"], "status": "accepted", "driver_name": driver.get("name"), "driver_phone": driver.get("phone"), "vehicle_number": driver.get("vehicle_number"), "vehicle_type": driver.get("vehicle_type"), "stringee_token": new_rider_token, "stringee_user_id": rider_clean_id, "driver_stringee_token": new_driver_token, "driver_stringee_user_id": driver_clean_id, "accepted_at": datetime.now().isoformat()}
     updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
     if not updated.data: raise HTTPException(status_code=409, detail="Already taken")
     await manager.broadcast_ride_taken(ride_id)
-    return {
-        "success":True,
-        "ride":updated.data[0],
-        "stringee_token": new_driver_token,
-        "driver_token": new_driver_token,
-        "rider_token": new_rider_token,
-        "driver_user_id": driver_clean_id,
-        "rider_user_id": rider_clean_id
-    }
+    return {"success":True, "ride":updated.data[0], "stringee_token": new_driver_token, "driver_token": new_driver_token, "rider_token": new_rider_token, "driver_user_id": driver_clean_id, "rider_user_id": rider_clean_id}
 
 @app.post("/rides/{ride_id}/verify-otp")
 def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
@@ -474,18 +438,7 @@ def get_active_ride(driver_id: str):
     if not res.data:
         d = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
         if d.data: res = supabase.table("rides").select("*").eq("driver_id", d.data[0]["id"]).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(1).execute()
-    if res.data:
-        ride = res.data[0]
-        try:
-            new_r_token, r_cid = generate_stringee_token(ride.get("stringee_user_id") or ride.get("user_id"), str(ride["id"]))
-            new_d_token, d_cid = generate_stringee_token(ride.get("driver_stringee_user_id") or ride.get("driver_id"), str(ride["id"]))
-            ride["stringee_token"] = new_r_token
-            ride["stringee_user_id"] = r_cid
-            ride["driver_stringee_token"] = new_d_token
-            ride["driver_stringee_user_id"] = d_cid
-            supabase.table("rides").update({"stringee_token": new_r_token, "stringee_user_id": r_cid, "driver_stringee_token": new_d_token, "driver_stringee_user_id": d_cid}).eq("id", ride["id"]).execute()
-        except: pass
-        return {"active": True, "ride": ride}
+    if res.data: return {"active": True, "ride": res.data[0]}
     return {"active": False, "ride": None}
 
 @app.websocket("/ws/drivers")
@@ -512,12 +465,9 @@ async def ws_ride(ws: WebSocket, ride_id: int):
     except WebSocketDisconnect: manager.disconnect(ride_id, ws)
 
 @app.get("/")
-def root(): return {"status":"Rivo API 10.0 - Filter + Sound + completed/cancelled/timeout -> archive"}
+def root(): return {"status":"Rivo API 12.0 - Scheduled Timeout Active"}
 
 @app.get("/admin/archived")
 def get_archived():
-    try:
-        res = supabase.table("rides_archive").select("*").order("archived_at", desc=True).limit(100).execute()
-        return res.data
-    except Exception as e:
-        return {"error": str(e)}
+    try: res = supabase.table("rides_archive").select("*").order("archived_at", desc=True).limit(100).execute(); return res.data
+    except Exception as e: return {"error": str(e)}
