@@ -1,3 +1,4 @@
+
 import os, json, time, jwt, uuid, math, httpx, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
@@ -10,7 +11,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 13.0 - Fixed Timeout")
+app = FastAPI(title="Rivo Taxi API - Final 13.0 - Range From DB Only")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -42,17 +43,23 @@ def haversine(lat1, lon1, lat2, lon2):
     except: return 99999.0
 
 def get_range_by_vehicle(vehicle_type: str, db_range=None):
+    # ⭐ ONLY FROM DRIVER TABLE - NO HARDCODED DEFAULT
     if db_range is not None:
-        try: return float(db_range)
-        except: pass
-    vt = str(vehicle_type).lower()
-    if "bike" in vt: return 5.0
-    if "auto" in vt or "e-rickshaw" in vt: return 7.0
-    if "parcel" in vt or "delivery" in vt or "courier" in vt: return 8.0
-    if "mini" in vt: return 10.0
-    if "sedan" in vt: return 12.0
-    if "suv" in vt or "xl" in vt: return 15.0
-    return 10.0
+        try:
+            r = float(db_range)
+            if r > 0:
+                return r
+        except:
+            pass
+    return None
+
+def is_within_range(driver_range, distance):
+    if driver_range is None:
+        return True
+    try:
+        return float(distance) <= float(driver_range)
+    except:
+        return True
 
 class ConnectionManager:
     def __init__(self):
@@ -87,9 +94,9 @@ class ConnectionManager:
             if driver_v and req_type and driver_v!= req_type: continue
             d_lat = driver.get("lat"); d_lng = driver.get("lng")
             if d_lat and d_lng:
-                drange = driver.get("range") or get_range_by_vehicle(driver_v)
+                drange = get_range_by_vehicle(driver_v, driver.get("range"))
                 dist = haversine(d_lat, d_lng, p_lat, p_lng)
-                if dist > float(drange): continue
+                if not is_within_range(drange, dist): continue
             try: await ws.send_text(json.dumps({"type":"new_ride_alert","ride":ride_data}))
             except: dead.append(driver)
         for d in dead:
@@ -119,7 +126,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             if d_lat and d_lng:
                 drange = get_range_by_vehicle(d_v, d.get('range'))
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if dist > float(drange): continue
+                if not is_within_range(drange, dist): continue
             if d.get('fcm_token'): tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
         if not tokens: return
@@ -173,16 +180,12 @@ def archive_and_delete_ride(ride_id: int):
         ride_data.pop('id', None)
         ride_data['original_ride_id'] = original_id
         ride_data['archived_at'] = datetime.now(timezone.utc).isoformat()
-        # status ko timeout/cancelled/completed jo bhi hai wahi rehne do
         try:
             local_supabase.table("rides_archive").insert(ride_data).execute()
             print(f"✅ Archived: {original_id} - {ride_data.get('status')}")
         except Exception as arch_e:
-            # agar archive table me id conflict ya schema issue ho to
             print(f"Archive insert error {original_id}: {arch_e}")
-            # try without some fields
             try:
-                # minimal data
                 minimal = {
                     "original_ride_id": original_id,
                     "user_id": ride_data.get('user_id'),
@@ -198,8 +201,7 @@ def archive_and_delete_ride(ride_id: int):
                 print(f"✅ Archived minimal: {original_id}")
             except Exception as e2:
                 print(f"Minimal archive fail {original_id}: {e2}")
-                return # delete mat karo agar archive fail hua
-
+                return
         try: local_supabase.table("rides").delete().eq("id", int(original_id)).execute()
         except: pass
         try: supabase.table("rides").delete().eq("id", int(original_id)).execute()
@@ -209,12 +211,11 @@ def archive_and_delete_ride(ride_id: int):
         print(f"❌ Archive Error {ride_id}: {e}")
         import traceback; traceback.print_exc()
 
-# 🔥 FIXED BACKEND TIMEOUT - UTC + Scheduled Logic
 TIMEOUT_MINUTES = 10
 
 async def auto_timeout_checker():
     print(f"⏰ Auto Timeout Checker Started - {TIMEOUT_MINUTES} min (UTC Fixed)", flush=True)
-    await asyncio.sleep(5) # startup wait
+    await asyncio.sleep(5)
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -228,7 +229,6 @@ async def auto_timeout_checker():
                 scheduled_str = r.get('scheduled_time')
                 should_timeout = False
                 reason = ""
-
                 if not scheduled_str or str(scheduled_str).strip() in ["", "null", "None"]:
                     if created_at_str:
                         try:
@@ -236,7 +236,6 @@ async def auto_timeout_checker():
                             if created_dt.tzinfo is None:
                                 created_dt = created_dt.replace(tzinfo=timezone.utc)
                             diff_min = (now - created_dt).total_seconds() / 60
-                            print(f"  Ride {ride_id} age {diff_min:.2f} min (created {created_dt})", flush=True)
                             if diff_min >= TIMEOUT_MINUTES:
                                 should_timeout = True
                                 reason = f"Normal timeout {diff_min:.1f}min"
@@ -248,32 +247,27 @@ async def auto_timeout_checker():
                         if sched_dt.tzinfo is None:
                             sched_dt = sched_dt.replace(tzinfo=timezone.utc)
                         timeout_at = sched_dt - timedelta(minutes=TIMEOUT_MINUTES)
-                        print(f"  Scheduled Ride {ride_id} sched={sched_dt} timeout_at={timeout_at} now={now}", flush=True)
                         if now >= timeout_at:
                             should_timeout = True
                             reason = f"Scheduled timeout - sched {sched_dt}"
                     except Exception as e:
                         print(f"  Sched parse error {ride_id}: {e} - {scheduled_str}", flush=True)
-
                 if should_timeout:
                     print(f"⏰ TIMING OUT {ride_id} - {reason}", flush=True)
                     try:
                         supabase.table("rides").update({"status": "timeout"}).eq("id", ride_id).execute()
                         archive_and_delete_ride(ride_id)
                         await manager.broadcast_ride_taken(ride_id)
-                        print(f"✅ Timeout done {ride_id}", flush=True)
                     except Exception as e:
                         print(f"Timeout fail {ride_id}: {e}", flush=True)
-
         except Exception as e:
             print(f"Checker error: {e}", flush=True)
-            import traceback; traceback.print_exc()
         await asyncio.sleep(30)
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("✅ Rivo API Started - Timeout Fixed")
+    print("✅ Rivo API Started - Range From DB Only")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -317,21 +311,22 @@ def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
 @app.post("/drivers/login")
 def driver_login(payload: DriverLoginRequest):
     try:
-        phone_input = payload.phone or payload.mobile or payload.driver_id or payload.username
-        password_input = payload.password
-        if not phone_input: raise HTTPException(status_code=400, detail="Phone/ID required")
-        phone_input = str(phone_input).strip()
-        res = supabase.table("drivers").select("*").eq("phone", phone_input).execute()
-        if not res.data: res = supabase.table("drivers").select("*").eq("id", phone_input).execute()
-        if not res.data: res = supabase.table("drivers").select("*").eq("driver_id", phone_input).execute()
+        raw_input = payload.phone or payload.mobile or payload.driver_id or payload.username or ""
+        password_input = payload.password or ""
+        driver_input = str(raw_input).strip()
+        password_input = str(password_input).strip()
+        print(f"LOGIN TRY: {driver_input}")
+        if not driver_input: raise HTTPException(status_code=400, detail="Phone/ID required")
+        res = supabase.table("drivers").select("*").or_(f"id.ilike.{driver_input},driver_id.ilike.{driver_input},phone.eq.{driver_input}").limit(1).execute()
+        if not res.data: res = supabase.table("drivers").select("*").ilike("id", driver_input).limit(1).execute()
+        if not res.data: res = supabase.table("drivers").select("*").ilike("driver_id", driver_input).limit(1).execute()
+        if not res.data: res = supabase.table("drivers").select("*").eq("phone", driver_input).limit(1).execute()
         if not res.data:
-            try: res = supabase.table("drivers").select("*").eq("mobile", phone_input).execute()
+            try: res = supabase.table("drivers").select("*").eq("mobile", driver_input).limit(1).execute()
             except: pass
         if not res.data: raise HTTPException(status_code=404, detail="Driver not found")
         driver = res.data[0]
-        db_pass = str(driver.get('password','')).strip()
-        input_pass = str(password_input).strip()
-        if db_pass!= input_pass: raise HTTPException(status_code=401, detail="Wrong password")
+        if str(driver.get('password','')).strip() != password_input: raise HTTPException(status_code=401, detail="Wrong password")
         if payload.fcm_token:
             try: supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", driver["id"]).execute()
             except: pass
@@ -355,20 +350,80 @@ async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)
     except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/drivers/{driver_id}/location")
-def update_driver_location(driver_id: str, payload: DriverLocationRequest):
+async def update_driver_location(driver_id: str, payload: DriverLocationRequest):
     lat = payload.latitude if payload.latitude is not None else payload.lat
     lng = payload.longitude if payload.longitude is not None else payload.lng
-    if lat is None or lng is None: raise HTTPException(status_code=400, detail="lat/lng required")
-    d_res = supabase.table("drivers").select("id").eq("id", driver_id).execute()
-    if not d_res.data: d_res = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
-    if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
+    if lat is None or lng is None:
+        raise HTTPException(status_code=400, detail="lat/lng required")
+
+    d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("id", driver_id).execute()
+    if not d_res.data:
+        d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("driver_id", driver_id).execute()
+    if not d_res.data:
+        raise HTTPException(status_code=404, detail="Driver not found")
+
     real_id = d_res.data[0]["id"]
-    supabase.table("drivers").update({"current_latitude": lat, "current_longitude": lng, "last_seen": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(), "is_online": True}).eq("id", real_id).execute()
+    driver_range = get_range_by_vehicle(d_res.data[0].get("vehicle_type"), d_res.data[0].get("range"))
+    d_vehicle = str(d_res.data[0].get("vehicle_type","")).lower()
+
+    supabase.table("drivers").update({
+        "current_latitude": lat,
+        "current_longitude": lng,
+        "last_seen": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "is_online": True
+    }).eq("id", real_id).execute()
+
     for d in manager.driver_connections:
-        if d.get("driver_id") == driver_id or d.get("driver_id") == real_id: d["lat"] = lat; d["lng"] = lng
-    try: supabase.table("rides").update({"driver_lat": lat, "driver_lng": lng}).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
-    except: pass
-    return {"success": True}
+        if d.get("driver_id") == driver_id or d.get("driver_id") == real_id:
+            d["lat"] = lat
+            d["lng"] = lng
+
+    nearby_rides = []
+    try:
+        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(30)
+        if d_vehicle:
+            q = q.eq("vehicle_type", d_vehicle)
+        pending_rides = q.execute().data or []
+
+        for ride in pending_rides:
+            try:
+                p_lat = float(ride.get("pickup_lat", 0))
+                p_lng = float(ride.get("pickup_lng", 0))
+                if p_lat == 0 or p_lng == 0:
+                    continue
+                dist = haversine(lat, lng, p_lat, p_lng)
+                if is_within_range(driver_range, dist):
+                    ride["distance_from_driver"] = round(dist, 2)
+                    ride["driver_range"] = driver_range if driver_range is not None else 999
+                    ride.pop("otp", None)
+                    nearby_rides.append(ride)
+            except:
+                continue
+
+        nearby_rides.sort(key=lambda x: x.get("distance_from_driver", 999))
+
+        if nearby_rides:
+            for conn in list(manager.driver_connections):
+                if conn.get("driver_id") == driver_id or conn.get("driver_id") == real_id:
+                    try:
+                        await conn["ws"].send_text(json.dumps({
+                            "type": "nearby_rides_update",
+                            "rides": nearby_rides,
+                            "count": len(nearby_rides)
+                        }))
+                    except:
+                        pass
+            print(f"📍 Driver {driver_id} entered range - Sent {len(nearby_rides)} rides")
+    except Exception as e:
+        print(f"Nearby check error: {e}")
+
+    try:
+        supabase.table("rides").update({"driver_lat": lat, "driver_lng": lng}).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
+    except:
+        pass
+
+    return {"success": True, "nearby_rides_count": len(nearby_rides)}
 
 @app.get("/rides/pending/list")
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
@@ -395,9 +450,10 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
                 p_lat = float(ride.get("pickup_lat", 0)); p_lng = float(ride.get("pickup_lng", 0))
                 if p_lat == 0 or p_lng == 0: continue
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if dist <= float(driver_range):
+                # ⭐ ONLY FROM DB - agar range None hai to sab dikhao
+                if driver_range is None or dist <= float(driver_range):
                     ride["distance_from_driver"] = round(dist, 2)
-                    ride["driver_range"] = driver_range
+                    ride["driver_range"] = driver_range if driver_range is not None else 999
                     ride.pop("otp", None)
                     filtered.append(ride)
             except: continue
@@ -519,7 +575,7 @@ async def ws_ride(ws: WebSocket, ride_id: int):
     except WebSocketDisconnect: manager.disconnect(ride_id, ws)
 
 @app.get("/")
-def root(): return {"status":"Rivo API 13.0 - Timeout Fixed - UTC"}
+def root(): return {"status":"Rivo API 13.0 - Range From DB Only - No Hardcoded"}
 
 @app.get("/admin/archived")
 def get_archived():
