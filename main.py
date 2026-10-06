@@ -1,7 +1,7 @@
-import os, json, time, jwt, uuid, math, httpx, asyncio, threading
+import os, json, time, jwt, uuid, math, httpx
 from datetime import datetime
 from typing import Optional, Dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 8.0 Archive Fixed")
+app = FastAPI(title="Rivo Taxi API - Final 10.0 - Filter + Sound + Archive")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -72,7 +72,6 @@ class ConnectionManager:
     async def connect_driver(self, ws: WebSocket, vehicle_type: str = "", lat: float = None, lng: float = None, driver_range: float = None, driver_id: str = ""):
         await ws.accept()
         self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
-        # same driver_id का पुराना connection हटाओ
         if driver_id:
             self.driver_connections = [d for d in self.driver_connections if d.get("driver_id")!= driver_id]
         self.driver_connections.append({"ws": ws, "vehicle_type": vehicle_type.lower().strip(), "lat": lat, "lng": lng, "range": driver_range, "driver_id": driver_id})
@@ -109,34 +108,72 @@ manager = ConnectionManager()
 
 def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
     try:
-        if not firebase_admin._apps: return
+        if not firebase_admin._apps: 
+            return
         v_type = vehicle_type.strip().lower()
+        # PENDING LIST WALA SAME FILTER
         all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range").eq("is_online", True).neq("fcm_token", "").execute().data or []
-        tokens = []; p_lat = float(ride_data.get('pickup_lat', 0)); p_lng = float(ride_data.get('pickup_lng', 0))
+        tokens = []
+        p_lat = float(ride_data.get('pickup_lat', 0))
+        p_lng = float(ride_data.get('pickup_lng', 0))
         for d in all_drivers:
             d_v = str(d.get('vehicle_type','')).lower().strip()
-            if d_v!= v_type: continue
-            d_lat = d.get('current_latitude'); d_lng = d.get('current_longitude')
+            if d_v != v_type: 
+                continue
+            d_lat = d.get('current_latitude')
+            d_lng = d.get('current_longitude')
             if d_lat and d_lng:
                 drange = get_range_by_vehicle(d_v, d.get('range'))
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if dist > float(drange): continue
-            if d.get('fcm_token'): tokens.append(d['fcm_token'])
+                if dist > float(drange): 
+                    continue
+            if d.get('fcm_token'): 
+                tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
-        if not tokens: return
+        if not tokens: 
+            print("No driver in range for FCM")
+            return
         is_parcel = "parcel" in str(ride_data.get('trip_type','')).lower()
-        title = "📦 New Parcel!" if is_parcel else f"🔔 New {vehicle_type} Ride!"
-        body = f"{ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:40]}"
-        android_config = messaging.AndroidConfig(priority='high', notification=messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert'))
-        # 🔥 FIX: पूरी ride data FCM में
-        safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
+        title = "📦 New Parcel Request!" if is_parcel else f"🔔 New {vehicle_type} Ride Nearby!"
+        body = f"{ride_data.get('pickup_address','')[:45]} -> {ride_data.get('drop_address','')[:30]} | ₹{ride_data.get('fare','')}"
+        android_notif = messaging.AndroidNotification(
+            channel_id='ride_channel_v5',
+            priority='max',
+            visibility='public',
+            sound='alert',
+            default_sound=False
+        )
+        android_config = messaging.AndroidConfig(
+            priority='high',
+            notification=android_notif
+        )
+        apns_config = messaging.APNSConfig(
+            payload=messaging.APNSPayload(
+                aps=messaging.Aps(sound='default', badge=1)
+            )
+        )
+        safe_ride = {k: v for k, v in ride_data.items() if k != 'otp'}
         msg = messaging.MulticastMessage(
             notification=messaging.Notification(title=title, body=body),
-            data={'vehicle_type': v_type, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert', 'ride_json': json.dumps(safe_ride, default=str)},
-            tokens=tokens, android=android_config)
+            data={
+                'vehicle_type': v_type, 
+                'ride_id': str(ride_data.get('id','')), 
+                'type': 'new_ride_alert', 
+                'fare': str(ride_data.get('fare','')),
+                'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+                'sound': 'alert',
+                'ride_json': json.dumps(safe_ride, default=str)
+            },
+            tokens=tokens, 
+            android=android_config,
+            apns=apns_config
+        )
         messaging.send_each_for_multicast(msg)
-        print(f"FCM Sent to {len(tokens)} drivers")
-    except Exception as e: print(f"FCM Error {e}")
+        print(f"✅ FCM Sent to {len(tokens)} drivers - Type:{v_type} with Sound")
+    except Exception as e: 
+        print(f"FCM Error {e}")
+        import traceback
+        traceback.print_exc()
 
 class RideCreateRequest(BaseModel):
     pickup_lat: float; pickup_lng: float; drop_lat: float; drop_lng: float
@@ -165,44 +202,51 @@ def generate_stringee_token(user_id: str, ride_id: str=""):
     token = jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256", headers={"cty": "stringee-api;v=1"})
     return token, clean_id
 
-# 🔥 ARCHIVE SYSTEM - FINAL
+# ARCHIVE SYSTEM - FINAL FOR 3 STATUS (completed, cancelled, timeout)
 def archive_and_delete_ride(ride_id: int):
     try:
-        # Thread के अंदर नया client बनाना ज्यादा safe है
         from supabase import create_client
         local_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
         res = local_supabase.table("rides").select("*").eq("id", ride_id).execute()
         if not res.data:
-            print(f"Archive Fail: Ride {ride_id} not found")
+            print(f"Archive: Ride {ride_id} not found")
             return
-
         ride_data = res.data[0]
         original_id = ride_data.get('id')
-
-        archive_data = ride_data.copy()
-        archive_data['original_ride_id'] = original_id
-        archive_data['archived_at'] = datetime.now().isoformat()
-
-        # 🔥 ये सबसे जरूरी है - पुरानी id हटाओ
-        archive_data.pop('id', None)
-        print(f"Trying to archive ride {original_id}...")
-        ins = local_supabase.table("rides_archive").insert(archive_data).execute()
-
-        if ins.data:
-            print(f"✅ Archived Success: {original_id} -> archive id {ins.data[0].get('id')}")
-            # अब rides से हटाओ
-            local_supabase.table("rides").delete().eq("id", original_id).execute()
-            print(f"🗑 Deleted from rides: {original_id}")
-        else:
-            print(f"❌ Archive Insert returned nil for {original_id}: {ins}")
-
+        ride_data.pop('id', None)
+        ride_data['original_ride_id'] = original_id
+        ride_data['archived_at'] = datetime.now().isoformat()
+        local_supabase.table("rides_archive").insert(ride_data).execute()
+        local_supabase.table("rides").delete().eq("id", original_id).execute()
+        print(f"✅ ARCHIVED {original_id} - {ride_data.get('status')}")
     except Exception as e:
         print(f"❌ Archive Error {ride_id}: {e}")
         import traceback
         traceback.print_exc()
 
+# --- RIDE ENDPOINTS - ALL ARCHIVE ---
+@app.put("/rides/{ride_id}/complete")
+def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
+    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now().isoformat()}).eq("id",ride_id).execute()
+    background_tasks.add_task(archive_and_delete_ride, ride_id)
+    return {"success":True, "archived": "in_progress"}
 
+@app.put("/rides/{ride_id}/cancel")
+async def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
+    q = supabase.table("rides").update({"status": "cancelled","cancelled_at": datetime.now().isoformat()}).eq("id", ride_id)
+    if user_id and user_id not in ["", "null"]:
+        chk = supabase.table("rides").select("id").eq("id", ride_id).eq("user_id", user_id).execute()
+        if chk.data: q = q.eq("user_id", user_id)
+    updated = q.execute()
+    if not updated.data: raise HTTPException(status_code=404, detail="Ride not found")
+    background_tasks.add_task(archive_and_delete_ride, ride_id)
+    return {"success": True, "ride": updated.data[0]}
+
+@app.put("/rides/{ride_id}/timeout")
+def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
+    supabase.table("rides").update({"status":"timeout"}).eq("id", ride_id).execute()
+    background_tasks.add_task(archive_and_delete_ride, ride_id)
+    return {"success": True, "archived": True}
 
 @app.post("/drivers/login")
 def driver_login(payload: DriverLoginRequest):
@@ -258,7 +302,6 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
     if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
     real_id = d_res.data[0]["id"]
     supabase.table("drivers").update({"current_latitude": lat, "current_longitude": lng, "last_seen": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "is_online": True}).eq("id", real_id).execute()
-    # 🔥 FIX: WS connections की location भी update
     for d in manager.driver_connections:
         if d.get("driver_id") == driver_id or d.get("driver_id") == real_id:
             d["lat"] = lat
@@ -425,12 +468,6 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
     supabase.table("rides").update({"status": "started","started_at": datetime.now().isoformat()}).eq("id", ride_id).execute()
     return {"success": True}
 
-@app.put("/rides/{ride_id}/complete")
-def complete_ride(ride_id: int):
-    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now().isoformat()}).eq("id",ride_id).execute()
-    threading.Thread(target=archive_and_delete_ride, args=(ride_id,)).start()
-    return {"success":True, "archived": True}
-
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
     res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(1).execute()
@@ -474,35 +511,13 @@ async def ws_ride(ws: WebSocket, ride_id: int):
         while True: await ws.receive_text()
     except WebSocketDisconnect: manager.disconnect(ride_id, ws)
 
-@app.put("/rides/{ride_id}/cancel")
-async def cancel_ride(ride_id: int, user_id: str = Query(None)):
-    try:
-        q = supabase.table("rides").update({"status": "cancelled","cancelled_at": datetime.now().isoformat()}).eq("id", ride_id)
-        if user_id and user_id.strip()!= "" and user_id!= "null":
-            res_check = supabase.table("rides").select("id").eq("id", ride_id).eq("user_id", user_id).execute()
-            if res_check.data: q = q.eq("user_id", user_id)
-        updated = q.execute()
-        if not updated.data: raise HTTPException(status_code=404, detail="Ride not found")
-        try:
-            await manager.broadcast_ride_taken(ride_id)
-            for driver in list(manager.driver_connections):
-                try: await driver["ws"].send_text(json.dumps({"type": "ride_cancelled","ride_id": ride_id}))
-                except: pass
-        except: pass
-        threading.Thread(target=archive_and_delete_ride, args=(ride_id,)).start()
-        return {"success": True, "ride": updated.data[0], "archived": True}
-    except HTTPException: raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/")
-def root(): return {"status":"Rivo API 8.0 - Archive System Active - rides table only pending/started"}
+def root(): return {"status":"Rivo API 10.0 - Filter + Sound + completed/cancelled/timeout -> archive"}
 
 @app.get("/admin/archived")
 def get_archived():
     try:
-        res = supabase.table("rides_archive").select("*").order("id", desc=True).limit(100).execute()
+        res = supabase.table("rides_archive").select("*").order("archived_at", desc=True).limit(100).execute()
         return res.data
     except Exception as e:
         return {"error": str(e)}
-
