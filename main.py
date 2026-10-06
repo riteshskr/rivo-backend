@@ -1,5 +1,5 @@
 import os, json, time, jwt, uuid, math, httpx, asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 12.0 - Scheduled Timeout + Archive")
+app = FastAPI(title="Rivo Taxi API - Final 13.0 - Fixed Timeout")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -166,86 +166,140 @@ def archive_and_delete_ride(ride_id: int):
         local_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
         res = local_supabase.table("rides").select("*").eq("id", ride_id).execute()
         if not res.data:
-            print(f"Archive: Ride {ride_id} not found")
+            print(f"Archive: Ride {ride_id} not found - maybe already archived")
             return
         ride_data = res.data[0]
         original_id = ride_data.get('id')
         ride_data.pop('id', None)
         ride_data['original_ride_id'] = original_id
-        ride_data['archived_at'] = datetime.now().isoformat()
-        local_supabase.table("rides_archive").insert(ride_data).execute()
-        print(f"✅ Inserted to archive: {original_id} - {ride_data.get('status')}")
+        ride_data['archived_at'] = datetime.now(timezone.utc).isoformat()
+        # status ko timeout/cancelled/completed jo bhi hai wahi rehne do
+        try:
+            local_supabase.table("rides_archive").insert(ride_data).execute()
+            print(f"✅ Archived: {original_id} - {ride_data.get('status')}")
+        except Exception as arch_e:
+            # agar archive table me id conflict ya schema issue ho to
+            print(f"Archive insert error {original_id}: {arch_e}")
+            # try without some fields
+            try:
+                # minimal data
+                minimal = {
+                    "original_ride_id": original_id,
+                    "user_id": ride_data.get('user_id'),
+                    "status": ride_data.get('status'),
+                    "fare": ride_data.get('fare'),
+                    "pickup_address": ride_data.get('pickup_address'),
+                    "drop_address": ride_data.get('drop_address'),
+                    "archived_at": datetime.now(timezone.utc).isoformat(),
+                    "vehicle_type": ride_data.get('vehicle_type'),
+                    "trip_type": ride_data.get('trip_type')
+                }
+                local_supabase.table("rides_archive").insert(minimal).execute()
+                print(f"✅ Archived minimal: {original_id}")
+            except Exception as e2:
+                print(f"Minimal archive fail {original_id}: {e2}")
+                return # delete mat karo agar archive fail hua
+
         try: local_supabase.table("rides").delete().eq("id", int(original_id)).execute()
         except: pass
         try: supabase.table("rides").delete().eq("id", int(original_id)).execute()
         except: pass
-        print(f"🗑 Deleted from rides: {original_id}")
+        print(f"🗑 Deleted: {original_id}")
     except Exception as e:
         print(f"❌ Archive Error {ride_id}: {e}")
+        import traceback; traceback.print_exc()
 
-# 🔥 BACKEND TIMEOUT - SCHEDULED TIME LOGIC
+# 🔥 FIXED BACKEND TIMEOUT - UTC + Scheduled Logic
 TIMEOUT_MINUTES = 10
 
 async def auto_timeout_checker():
-    print(f"⏰ Auto Timeout Checker Started - {TIMEOUT_MINUTES} min (Scheduled Logic)")
+    print(f"⏰ Auto Timeout Checker Started - {TIMEOUT_MINUTES} min (UTC Fixed)", flush=True)
+    await asyncio.sleep(5) # startup wait
     while True:
         try:
-            now = datetime.now()
-            pending_res = supabase.table("rides").select("id,created_at,scheduled_time").eq("status", "pending").limit(50).execute()
-            if pending_res.data:
-                for r in pending_res.data:
-                    ride_id = r['id']
-                    created_at_str = r.get('created_at')
-                    scheduled_str = r.get('scheduled_time')
-                    should_timeout = False
+            now = datetime.now(timezone.utc)
+            pending_res = supabase.table("rides").select("id,created_at,scheduled_time,status").eq("status", "pending").limit(100).execute()
+            rides = pending_res.data or []
+            if rides:
+                print(f"⏰ Checking {len(rides)} pending at {now.isoformat()}", flush=True)
+            for r in rides:
+                ride_id = r['id']
+                created_at_str = r.get('created_at')
+                scheduled_str = r.get('scheduled_time')
+                should_timeout = False
+                reason = ""
 
-                    # CASE 1: Normal Ride (scheduled_time null)
-                    if not scheduled_str or str(scheduled_str).strip() in ["", "null", "None"]:
-                        if created_at_str:
-                            try:
-                                created_dt = datetime.fromisoformat(str(created_at_str).replace('Z',''))
-                                if created_dt.tzinfo: created_dt = created_dt.replace(tzinfo=None)
-                                if (now - created_dt).total_seconds() / 60 >= TIMEOUT_MINUTES:
-                                    should_timeout = True
-                            except: pass
-                    # CASE 2: Scheduled Ride
-                    else:
+                if not scheduled_str or str(scheduled_str).strip() in ["", "null", "None"]:
+                    if created_at_str:
                         try:
-                            sched_dt = datetime.fromisoformat(str(scheduled_str).replace('Z',''))
-                            if sched_dt.tzinfo: sched_dt = sched_dt.replace(tzinfo=None)
-                            timeout_at = sched_dt - timedelta(minutes=TIMEOUT_MINUTES)
-                            if now >= timeout_at:
+                            created_dt = datetime.fromisoformat(str(created_at_str).replace('Z','+00:00'))
+                            if created_dt.tzinfo is None:
+                                created_dt = created_dt.replace(tzinfo=timezone.utc)
+                            diff_min = (now - created_dt).total_seconds() / 60
+                            print(f"  Ride {ride_id} age {diff_min:.2f} min (created {created_dt})", flush=True)
+                            if diff_min >= TIMEOUT_MINUTES:
                                 should_timeout = True
-                                print(f"⏰ Scheduled ride {ride_id} - Scheduled: {sched_dt}, Timeout At: {timeout_at}, Now: {now}")
+                                reason = f"Normal timeout {diff_min:.1f}min"
                         except Exception as e:
-                            print(f"Scheduled parse error {ride_id}: {e}")
+                            print(f"  Parse error {ride_id}: {e} - {created_at_str}", flush=True)
+                else:
+                    try:
+                        sched_dt = datetime.fromisoformat(str(scheduled_str).replace('Z','+00:00'))
+                        if sched_dt.tzinfo is None:
+                            sched_dt = sched_dt.replace(tzinfo=timezone.utc)
+                        timeout_at = sched_dt - timedelta(minutes=TIMEOUT_MINUTES)
+                        print(f"  Scheduled Ride {ride_id} sched={sched_dt} timeout_at={timeout_at} now={now}", flush=True)
+                        if now >= timeout_at:
+                            should_timeout = True
+                            reason = f"Scheduled timeout - sched {sched_dt}"
+                    except Exception as e:
+                        print(f"  Sched parse error {ride_id}: {e} - {scheduled_str}", flush=True)
 
-                    if should_timeout:
-                        try:
-                            supabase.table("rides").update({"status": "timeout"}).eq("id", ride_id).execute()
-                            archive_and_delete_ride(ride_id)
-                            await manager.broadcast_ride_taken(ride_id)
-                            print(f"⏰ Auto-Timeout & Archived: {ride_id}")
-                        except Exception as e:
-                            print(f"Timeout error {ride_id}: {e}")
+                if should_timeout:
+                    print(f"⏰ TIMING OUT {ride_id} - {reason}", flush=True)
+                    try:
+                        supabase.table("rides").update({"status": "timeout"}).eq("id", ride_id).execute()
+                        archive_and_delete_ride(ride_id)
+                        await manager.broadcast_ride_taken(ride_id)
+                        print(f"✅ Timeout done {ride_id}", flush=True)
+                    except Exception as e:
+                        print(f"Timeout fail {ride_id}: {e}", flush=True)
+
         except Exception as e:
-            print(f"Timeout checker error: {e}")
-        await asyncio.sleep(60)
+            print(f"Checker error: {e}", flush=True)
+            import traceback; traceback.print_exc()
+        await asyncio.sleep(30)
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("✅ Rivo API Started with Auto Timeout (Scheduled Logic)")
+    print("✅ Rivo API Started - Timeout Fixed")
+
+@app.get("/admin/check-timeout-now")
+async def check_timeout_now():
+    now = datetime.now(timezone.utc)
+    pending = supabase.table("rides").select("id,created_at,scheduled_time").eq("status", "pending").execute().data or []
+    result = []
+    for r in pending:
+        try:
+            c_str = r.get('created_at')
+            c_dt = datetime.fromisoformat(str(c_str).replace('Z','+00:00')) if c_str else None
+            if c_dt and c_dt.tzinfo is None: c_dt = c_dt.replace(tzinfo=timezone.utc)
+            diff = (now - c_dt).total_seconds()/60 if c_dt else 0
+            result.append({"id": r['id'], "created_at": c_str, "age_min": round(diff,2), "scheduled": r.get('scheduled_time'), "should_timeout": diff >= TIMEOUT_MINUTES and not r.get('scheduled_time')})
+        except Exception as e:
+            result.append({"id": r['id'], "error": str(e), "created": r.get('created_at')})
+    return {"now_utc": now.isoformat(), "timeout_minutes": TIMEOUT_MINUTES, "pending_count": len(result), "rides": result}
 
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
-    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now().isoformat()}).eq("id",ride_id).execute()
+    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id",ride_id).execute()
     background_tasks.add_task(archive_and_delete_ride, ride_id)
     return {"success":True}
 
 @app.put("/rides/{ride_id}/cancel")
 async def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
-    q = supabase.table("rides").update({"status": "cancelled","cancelled_at": datetime.now().isoformat()}).eq("id", ride_id)
+    q = supabase.table("rides").update({"status": "cancelled","cancelled_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id)
     if user_id and user_id not in ["", "null"]:
         chk = supabase.table("rides").select("id").eq("id", ride_id).eq("user_id", user_id).execute()
         if chk.data: q = q.eq("user_id", user_id)
@@ -279,7 +333,7 @@ def driver_login(payload: DriverLoginRequest):
         input_pass = str(password_input).strip()
         if db_pass!= input_pass: raise HTTPException(status_code=401, detail="Wrong password")
         if payload.fcm_token:
-            try: supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now().isoformat()}).eq("id", driver["id"]).execute()
+            try: supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", driver["id"]).execute()
             except: pass
         return driver
     except HTTPException: raise
@@ -309,7 +363,7 @@ def update_driver_location(driver_id: str, payload: DriverLocationRequest):
     if not d_res.data: d_res = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
     if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
     real_id = d_res.data[0]["id"]
-    supabase.table("drivers").update({"current_latitude": lat, "current_longitude": lng, "last_seen": datetime.now().isoformat(), "updated_at": datetime.now().isoformat(), "is_online": True}).eq("id", real_id).execute()
+    supabase.table("drivers").update({"current_latitude": lat, "current_longitude": lng, "last_seen": datetime.now(timezone.utc).isoformat(), "updated_at": datetime.now(timezone.utc).isoformat(), "is_online": True}).eq("id", real_id).execute()
     for d in manager.driver_connections:
         if d.get("driver_id") == driver_id or d.get("driver_id") == real_id: d["lat"] = lat; d["lng"] = lng
     try: supabase.table("rides").update({"driver_lat": lat, "driver_lng": lng}).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
@@ -394,7 +448,7 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
         "vehicle_type": payload.vehicle_type, "distance": payload.distance, "fare": payload.fare,
         "trip_type": final_trip, "status": "pending", "otp": payload.otp,
         "city": "", "country": "", "currency": "INR",
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
         "scheduled_time": payload.scheduled_time,
         "stringee_token": token, "stringee_user_id": clean_id
     }
@@ -416,7 +470,7 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     old_rider_user_id = ride_res.data[0].get("stringee_user_id") or ride_res.data[0].get("user_id")
     new_rider_token, rider_clean_id = generate_stringee_token(old_rider_user_id, str(ride_id))
     new_driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
-    ride_update = {"driver_id": driver["id"], "status": "accepted", "driver_name": driver.get("name"), "driver_phone": driver.get("phone"), "vehicle_number": driver.get("vehicle_number"), "vehicle_type": driver.get("vehicle_type"), "stringee_token": new_rider_token, "stringee_user_id": rider_clean_id, "driver_stringee_token": new_driver_token, "driver_stringee_user_id": driver_clean_id, "accepted_at": datetime.now().isoformat()}
+    ride_update = {"driver_id": driver["id"], "status": "accepted", "driver_name": driver.get("name"), "driver_phone": driver.get("phone"), "vehicle_number": driver.get("vehicle_number"), "vehicle_type": driver.get("vehicle_type"), "stringee_token": new_rider_token, "stringee_user_id": rider_clean_id, "driver_stringee_token": new_driver_token, "driver_stringee_user_id": driver_clean_id, "accepted_at": datetime.now(timezone.utc).isoformat()}
     updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
     if not updated.data: raise HTTPException(status_code=409, detail="Already taken")
     await manager.broadcast_ride_taken(ride_id)
@@ -429,7 +483,7 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
     ride = res.data[0]
     if ride["status"] == "started": return {"success": True}
     if str(ride.get("otp","")).strip()!= str(payload.otp).strip(): raise HTTPException(status_code=400, detail="Galat OTP")
-    supabase.table("rides").update({"status": "started","started_at": datetime.now().isoformat()}).eq("id", ride_id).execute()
+    supabase.table("rides").update({"status": "started","started_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id).execute()
     return {"success": True}
 
 @app.get("/drivers/{driver_id}/active-ride")
@@ -465,7 +519,7 @@ async def ws_ride(ws: WebSocket, ride_id: int):
     except WebSocketDisconnect: manager.disconnect(ride_id, ws)
 
 @app.get("/")
-def root(): return {"status":"Rivo API 12.0 - Scheduled Timeout Active"}
+def root(): return {"status":"Rivo API 13.0 - Timeout Fixed - UTC"}
 
 @app.get("/admin/archived")
 def get_archived():
