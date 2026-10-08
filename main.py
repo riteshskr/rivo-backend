@@ -357,54 +357,59 @@ def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
 # ================= NEW FEATURE 1 & 2 =================
 
 @app.put("/rides/{ride_id}/drop-complete")
-def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
+def drop_single_pool_ride(
+    ride_id: int,
+    group_id: str = Query(None),
+    driver_id: str = Query(None),
+    background_tasks: BackgroundTasks = None
+):
     """
-    FEATURE 2: Beech me drop = seat khali
-    Ek pool ride ko completed karo aur group ki bachi seats return karo
+    Pool में Drop = उस Ride का Status Completed + सीट खाली
     """
+    # Ride निकालो
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
     if not res.data:
-        raise HTTPException(404, "Ride nahi mili")
+        raise HTTPException(404, "Ride नहीं मिली")
+
     ride = res.data[0]
     gid = group_id or ride.get("pool_group_id")
-    
-    # Is ride ko completed mark karo
+    seats_in_this_ride = int(ride.get("seats_booked") or 1)
+
+    # 1. इसी Ride को COMPLETED कर दो - यही आपका main requirement था
     supabase.table("rides").update({
-        "status": "completed", 
-        "passenger_status": "dropped", 
+        "status": "completed",
+        "passenger_status": "dropped",
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "dropped_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", ride_id).execute()
-    
-    if background_tasks:
-        background_tasks.add_task(archive_and_delete_ride, ride_id)
-    
-    # Group me kitni seats bachi hai?
+
+    # 2. Group में कितनी सीट बची है वो निकालो
     booked = 0
     total = 4
     if gid:
+        # सिर्फ active rides की सीट गिनो
         remaining_res = supabase.table("rides").select("seats_booked,total_seats,max_pool_seats").eq("pool_group_id", gid).in_("status", ["accepted","started"]).execute()
         remaining_data = remaining_res.data or []
         booked = sum([int(r.get("seats_booked") or 1) for r in remaining_data])
+
         if remaining_data:
-            first = remaining_data[0]
-            total = int(first.get("total_seats") or first.get("max_pool_seats") or 4)
+            total = int(remaining_data[0].get("total_seats") or remaining_data[0].get("max_pool_seats") or 4)
         else:
-            # Sab complete ho gaye
+            # सब Drop हो गए तो Total वहीं रहेगा
+            total = int(ride.get("total_seats") or ride.get("max_pool_seats") or 4)
             booked = 0
-            # Original total lo
-            v_res = supabase.table("vehicles").select("max_pool_seats").ilike("name", ride.get("vehicle_type","")).limit(1).execute()
-            if v_res.data:
-                total = int(v_res.data[0].get("max_pool_seats") or 4)
-    
+
+    # 3. Archive बाद में करो, तुरंत नहीं - ताकि Driver App में दिखे कि Drop हो गया
+    # background_tasks.add_task(archive_and_delete_ride, ride_id) -> इसको हटा दो, नहीं तो तुरंत delete हो जाएगी
+
     return {
-        "success": True, 
+        "success": True,
         "ride_id": ride_id,
+        "status": "completed", # Flutter को ये भेजो
         "booked_seats": booked,
         "total_seats": total,
         "left_seats": total - booked,
-        "group_id": gid,
-        "message": f"Dropped! {total - booked} seats left"
+        "message": f"Ride {ride_id} Dropped! {total - booked} seats left"
     }
 
 @app.get("/rides/pool/group/{group_id}/driver/{driver_id}")
