@@ -1,4 +1,3 @@
-
 import os, json, time, jwt, uuid, math, httpx, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
@@ -11,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 13.0 - Range From DB Only")
+app = FastAPI(title="Rivo Taxi API - Final 16.0 - Full 581+ Pool Vehicle Seats")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -60,6 +59,46 @@ def is_within_range(driver_range, distance):
         return float(distance) <= float(driver_range)
     except:
         return True
+
+def get_time_slot(scheduled_time_str=None):
+    try:
+        if scheduled_time_str:
+            dt = datetime.fromisoformat(str(scheduled_time_str).replace('Z','+00:00'))
+            hour = dt.hour if dt.tzinfo is None else dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
+        else:
+            now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+            hour = now_ist.hour
+        if hour >= 20 or hour < 6:
+            return "night"
+        return "day"
+    except:
+        return "day"
+
+def calculate_fare_by_type(vehicle_row, distance_km, trip_type, scheduled_time_str=None):
+    slot = get_time_slot(scheduled_time_str)
+    distance_km = float(distance_km)
+    if trip_type == "pool":
+        if slot == "night":
+            rate = float(vehicle_row.get("pool_night_per_km") or vehicle_row.get("pool_per_km") or 8.0)
+        else:
+            rate = float(vehicle_row.get("pool_per_km") or 6.0)
+        min_fare = float(vehicle_row.get("pool_min_fare") or 30.0)
+    elif trip_type == "parcel":
+        if slot == "night":
+            rate = float(vehicle_row.get("parcel_night_per_km") or vehicle_row.get("parcel_per_km") or 10.0)
+        else:
+            rate = float(vehicle_row.get("parcel_per_km") or 8.0)
+        min_fare = float(vehicle_row.get("parcel_min_fare") or 50.0)
+    else:
+        if slot == "night":
+            rate = float(vehicle_row.get("night_fare_per_km") or vehicle_row.get("fare_per_km") or 12.0)
+        else:
+            rate = float(vehicle_row.get("fare_per_km") or 10.0)
+        min_fare = float(vehicle_row.get("min_fare") or 50.0)
+    fare = rate * distance_km
+    if fare < min_fare:
+        fare = min_fare
+    return round(fare, 2), slot, rate
 
 class ConnectionManager:
     def __init__(self):
@@ -131,8 +170,14 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         tokens = list(set(tokens))
         if not tokens: return
         is_parcel = "parcel" in str(ride_data.get('trip_type','')).lower()
-        title = "📦 New Parcel Request!" if is_parcel else f"🔔 New {vehicle_type} Ride Nearby!"
-        body = f"{ride_data.get('pickup_address','')[:45]} -> {ride_data.get('drop_address','')[:30]} | ₹{ride_data.get('fare','')}"
+        is_pool = "pool" in str(ride_data.get('trip_type','')).lower()
+        if is_parcel:
+            title = "📦 New Parcel Request!"
+        elif is_pool:
+            title = f"👥 New Pool {vehicle_type} Ride! Seats:{ride_data.get('max_pool_seats',3)}"
+        else:
+            title = f"🔔 New {vehicle_type} Ride Nearby!"
+        body = f"{ride_data.get('pickup_address','')[:45]} -> {ride_data.get('drop_address','')[:30]} | ₹{ride_data.get('fare','')} | {ride_data.get('fare_slot','day')}"
         android_notif = messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert', default_sound=False)
         android_config = messaging.AndroidConfig(priority='high', notification=android_notif)
         apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1)))
@@ -154,6 +199,7 @@ class DriverLoginRequest(BaseModel):
 
 class OtpVerifyRequest(BaseModel): otp: str
 class DriverLocationRequest(BaseModel): lat: Optional[float]=None; lng: Optional[float]=None; latitude: Optional[float]=None; longitude: Optional[float]=None
+class PoolDropRequest(BaseModel): driver_id: str
 
 def generate_stringee_token(user_id: str, ride_id: str=""):
     if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET: return None, None
@@ -240,7 +286,7 @@ async def auto_timeout_checker():
                                 should_timeout = True
                                 reason = f"Normal timeout {diff_min:.1f}min"
                         except Exception as e:
-                            print(f"  Parse error {ride_id}: {e} - {created_at_str}", flush=True)
+                            print(f" Parse error {ride_id}: {e} - {created_at_str}", flush=True)
                 else:
                     try:
                         sched_dt = datetime.fromisoformat(str(scheduled_str).replace('Z','+00:00'))
@@ -251,7 +297,7 @@ async def auto_timeout_checker():
                             should_timeout = True
                             reason = f"Scheduled timeout - sched {sched_dt}"
                     except Exception as e:
-                        print(f"  Sched parse error {ride_id}: {e} - {scheduled_str}", flush=True)
+                        print(f" Sched parse error {ride_id}: {e} - {scheduled_str}", flush=True)
                 if should_timeout:
                     print(f"⏰ TIMING OUT {ride_id} - {reason}", flush=True)
                     try:
@@ -267,7 +313,7 @@ async def auto_timeout_checker():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("✅ Rivo API Started - Range From DB Only")
+    print("✅ Rivo API Started - Range From DB Only - Full 581 + Pool")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -287,9 +333,22 @@ async def check_timeout_now():
 
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
-    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id",ride_id).execute()
+    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat(), "passenger_status": "dropped"}).eq("id",ride_id).execute()
     background_tasks.add_task(archive_and_delete_ride, ride_id)
     return {"success":True}
+
+@app.put("/rides/{ride_id}/drop-passenger")
+def drop_passenger(ride_id: int, payload: PoolDropRequest, background_tasks: BackgroundTasks):
+    res = supabase.table("rides").select("*").eq("id", ride_id).execute()
+    if not res.data: raise HTTPException(404, "Ride नहीं मिली")
+    ride = res.data[0]
+    supabase.table("rides").update({"passenger_status": "dropped", "status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id).execute()
+    background_tasks.add_task(archive_and_delete_ride, ride_id)
+    gid = ride.get("pool_group_id")
+    if gid:
+        remaining = supabase.table("rides").select("id").eq("pool_group_id", gid).neq("status","completed").execute().data or []
+        return {"success": True, "group_completed": len(remaining)==0, "remaining": len(remaining)}
+    return {"success": True, "group_completed": True}
 
 @app.put("/rides/{ride_id}/cancel")
 def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
@@ -324,7 +383,7 @@ def driver_login(payload: DriverLoginRequest):
             except: pass
         if not res.data: raise HTTPException(status_code=404, detail="Driver not found")
         driver = res.data[0]
-        if str(driver.get('password','')).strip() != password_input: raise HTTPException(status_code=401, detail="Wrong password")
+        if str(driver.get('password','')).strip()!= password_input: raise HTTPException(status_code=401, detail="Wrong password")
         if payload.fcm_token:
             try: supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", driver["id"]).execute()
             except: pass
@@ -353,17 +412,14 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
     lng = payload.longitude if payload.longitude is not None else payload.lng
     if lat is None or lng is None:
         raise HTTPException(status_code=400, detail="lat/lng required")
-
     d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("id", driver_id).execute()
     if not d_res.data:
         d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("driver_id", driver_id).execute()
     if not d_res.data:
         raise HTTPException(status_code=404, detail="Driver not found")
-
     real_id = d_res.data[0]["id"]
     driver_range = get_range_by_vehicle(d_res.data[0].get("vehicle_type"), d_res.data[0].get("range"))
     d_vehicle = str(d_res.data[0].get("vehicle_type","")).lower()
-
     supabase.table("drivers").update({
         "current_latitude": lat,
         "current_longitude": lng,
@@ -371,19 +427,16 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "is_online": True
     }).eq("id", real_id).execute()
-
     for d in manager.driver_connections:
         if d.get("driver_id") == driver_id or d.get("driver_id") == real_id:
             d["lat"] = lat
             d["lng"] = lng
-
     nearby_rides = []
     try:
         q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(30)
         if d_vehicle:
             q = q.eq("vehicle_type", d_vehicle)
         pending_rides = q.execute().data or []
-
         for ride in pending_rides:
             try:
                 p_lat = float(ride.get("pickup_lat", 0))
@@ -398,9 +451,7 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
                     nearby_rides.append(ride)
             except:
                 continue
-
         nearby_rides.sort(key=lambda x: x.get("distance_from_driver", 999))
-
         if nearby_rides:
             for conn in list(manager.driver_connections):
                 if conn.get("driver_id") == driver_id or conn.get("driver_id") == real_id:
@@ -415,12 +466,10 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
             print(f"📍 Driver {driver_id} entered range - Sent {len(nearby_rides)} rides")
     except Exception as e:
         print(f"Nearby check error: {e}")
-
     try:
         supabase.table("rides").update({"driver_lat": lat, "driver_lng": lng}).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
     except:
         pass
-
     return {"success": True, "nearby_rides_count": len(nearby_rides)}
 
 @app.get("/rides/pending/list")
@@ -448,7 +497,6 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
                 p_lat = float(ride.get("pickup_lat", 0)); p_lng = float(ride.get("pickup_lng", 0))
                 if p_lat == 0 or p_lng == 0: continue
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                # ⭐ ONLY FROM DB - agar range None hai to sab dikhao
                 if driver_range is None or dist <= float(driver_range):
                     ride["distance_from_driver"] = round(dist, 2)
                     ride["driver_range"] = driver_range if driver_range is not None else 999
@@ -462,7 +510,9 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
 
 @app.get("/vehicles")
 def get_vehicles():
-    try: res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, icon_path").order("id", desc=False).execute(); return res.data or []
+    try:
+        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, pool_per_km, pool_night_per_km, pool_min_fare, max_pool_seats, icon_path").order("id", desc=False).execute()
+        return res.data or []
     except: return []
 
 @app.get("/rides/{ride_id}")
@@ -493,18 +543,45 @@ def get_ongoing(user_id: str):
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     token, clean_id = generate_stringee_token(user_id, "new")
-    final_trip = "parcel" if "parcel" in str(payload.trip_type).lower() else "ride"
+    raw_type = str(payload.trip_type).lower()
+    final_trip = "parcel" if "parcel" in raw_type else "pool" if "pool" in raw_type else "ride"
+    v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).limit(1).execute()
+    if not v_res.data: v_res = supabase.table("vehicles").select("*").limit(1).execute()
+    vehicle_row = v_res.data[0] if v_res.data else {}
+    correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
+    max_seats = int(vehicle_row.get("max_pool_seats") or 3)
+    pool_group_id = None
+    is_pool = False
+    if final_trip == "pool":
+        is_pool = True
+        try:
+            active_pools = supabase.table("rides").select("pool_group_id, vehicle_type").eq("trip_type","pool").in_("status",["accepted","started"]).eq("vehicle_type", payload.vehicle_type).limit(20).execute().data or []
+            found_group = None
+            for p in active_pools:
+                gid = p.get("pool_group_id")
+                if not gid: continue
+                cnt_res = supabase.table("rides").select("id", count="exact").eq("pool_group_id", gid).in_("status",["accepted","started"]).in_("passenger_status",["waiting","onboard"]).execute()
+                cnt = cnt_res.count or 0
+                if cnt < max_seats:
+                    found_group = gid
+                    break
+            pool_group_id = found_group if found_group else f"POOL_{uuid.uuid4().hex[:6].upper()}"
+        except: pool_group_id = f"POOL_{uuid.uuid4().hex[:6].upper()}"
     ride_data = {
-        "user_id": user_id, 
+        "user_id": user_id,
         "pickup_lat": payload.pickup_lat, "pickup_lng": payload.pickup_lng,
         "drop_lat": payload.drop_lat, "drop_lng": payload.drop_lng,
         "pickup_address": payload.pickup_address, "drop_address": payload.drop_address,
-        "vehicle_type": payload.vehicle_type, "distance": payload.distance, "fare": payload.fare,
+        "vehicle_type": payload.vehicle_type, "distance": payload.distance, "fare": correct_fare,
         "trip_type": final_trip, "status": "pending", "otp": payload.otp,
         "city": "", "country": "", "currency": "INR",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "scheduled_time": payload.scheduled_time,
-        "stringee_token": token, "stringee_user_id": clean_id
+        "stringee_token": token, "stringee_user_id": clean_id,
+        "pool_group_id": pool_group_id, "is_pool_ride": is_pool,
+        "passenger_status": "waiting" if is_pool else None,
+        "fare_slot": slot, "fare_rate": rate,
+        "max_pool_seats": max_seats if is_pool else None
     }
     res = supabase.table("rides").insert(ride_data).execute()
     if not res.data: raise HTTPException(status_code=500, detail="Failed")
@@ -537,17 +614,17 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
     ride = res.data[0]
     if ride["status"] == "started": return {"success": True}
     if str(ride.get("otp","")).strip()!= str(payload.otp).strip(): raise HTTPException(status_code=400, detail="Galat OTP")
-    supabase.table("rides").update({"status": "started","started_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id).execute()
+    supabase.table("rides").update({"status": "started","started_at": datetime.now(timezone.utc).isoformat(), "passenger_status": "onboard"}).eq("id", ride_id).execute()
     return {"success": True}
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
-    res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(1).execute()
+    res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(10).execute()
     if not res.data:
         d = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
-        if d.data: res = supabase.table("rides").select("*").eq("driver_id", d.data[0]["id"]).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(1).execute()
-    if res.data: return {"active": True, "ride": res.data[0]}
-    return {"active": False, "ride": None}
+        if d.data: res = supabase.table("rides").select("*").eq("driver_id", d.data[0]["id"]).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(10).execute()
+    if res.data: return {"active": True, "rides": res.data, "ride": res.data[0]}
+    return {"active": False, "rides": [], "ride": None}
 
 @app.websocket("/ws/drivers")
 async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = Query(None), lng: float = Query(None), driver_id: str = Query(None)):
@@ -573,9 +650,10 @@ async def ws_ride(ws: WebSocket, ride_id: int):
     except WebSocketDisconnect: manager.disconnect(ride_id, ws)
 
 @app.get("/")
-def root(): return {"status":"Rivo API 13.0 - Range From DB Only - No Hardcoded"}
+def root(): return {"status":"Rivo API 16.0 - Full 581+ Pool Vehicle Seats - All Options OK"}
 
 @app.get("/admin/archived")
 def get_archived():
     try: res = supabase.table("rides_archive").select("*").order("archived_at", desc=True).limit(100).execute(); return res.data
     except Exception as e: return {"error": str(e)}
+

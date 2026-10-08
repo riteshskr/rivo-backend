@@ -292,15 +292,13 @@ def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
     return {"success":True}
 
 @app.put("/rides/{ride_id}/cancel")
-async def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
-    q = supabase.table("rides").update({"status": "cancelled","cancelled_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id)
-    if user_id and user_id not in ["", "null"]:
-        chk = supabase.table("rides").select("id").eq("id", ride_id).eq("user_id", user_id).execute()
-        if chk.data: q = q.eq("user_id", user_id)
-    updated = q.execute()
-    if not updated.data: raise HTTPException(status_code=404, detail="Ride not found")
-    background_tasks.add_task(archive_and_delete_ride, ride_id)
-    return {"success": True, "ride": updated.data[0]}
+def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
+    supabase.table("rides").update({"status": "cancelled"}).eq("id", ride_id).execute()
+    try:
+        background_tasks.add_task(archive_and_delete_ride, ride_id)
+    except:
+        pass
+    return {"success": True}
 
 @app.put("/rides/{ride_id}/timeout")
 def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
