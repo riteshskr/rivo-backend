@@ -1,659 +1,751 @@
-import os, json, time, jwt, uuid, math, httpx, asyncio
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from supabase import create_client, Client
-from dotenv import load_dotenv
-import firebase_admin
-from firebase_admin import credentials, messaging
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:stringee_plugin/stringee_plugin.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'firebase_options.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:flutter_polyline_points/flutter_polyline_points.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 
-load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 16.0 - Full 581+ Pool Vehicle Seats")
+class AppConstants {
+  static const String baseUrl = 'https://rivo-api-ezoo.onrender.com';
+  static const String notifChannelId = 'ride_channel_v5';
+  static const String notifChannelName = 'New Ride Alerts V5';
+}
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
+final FlutterLocalNotificationsPlugin _notif = FlutterLocalNotificationsPlugin();
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+class NotificationService {
+  static Future<void> init() async {
+    const androidInit = AndroidInitializationSettings('@mipmap/ic_launcher');
+    await _notif.initialize(const InitializationSettings(android: androidInit));
+    final androidPlugin = _notif.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    const channel = AndroidNotificationChannel(AppConstants.notifChannelId, AppConstants.notifChannelName, importance: Importance.max, sound: RawResourceAndroidNotificationSound('alert'), playSound: true, enableVibration: true);
+    await androidPlugin?.createNotificationChannel(channel);
+  }
 
-STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
-STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-
-try:
-    fj = os.getenv("FIREBASE_CREDENTIALS_JSON")
-    if fj and not firebase_admin._apps:
-        cred = credentials.Certificate(json.loads(fj))
-        firebase_admin.initialize_app(cred)
-        print("✅ Firebase OK")
-except Exception as e:
-    print(f"❌ Firebase Error: {e}")
-
-def haversine(lat1, lon1, lat2, lon2):
-    try:
-        R = 6371.0
-        dlat = math.radians(lat2 - lat1)
-        dlon = math.radians(lon2 - lon1)
-        a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        return R * c
-    except: return 99999.0
-
-def get_range_by_vehicle(vehicle_type: str, db_range=None):
-    # ⭐ ONLY FROM DRIVER TABLE - NO HARDCODED DEFAULT
-    if db_range is not None:
-        try:
-            r = float(db_range)
-            if r > 0:
-                return r
-        except:
-            pass
-    return None
-
-def is_within_range(driver_range, distance):
-    if driver_range is None:
-        return True
-    try:
-        return float(distance) <= float(driver_range)
-    except:
-        return True
-
-def get_time_slot(scheduled_time_str=None):
-    try:
-        if scheduled_time_str:
-            dt = datetime.fromisoformat(str(scheduled_time_str).replace('Z','+00:00'))
-            hour = dt.hour if dt.tzinfo is None else dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
-        else:
-            now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-            hour = now_ist.hour
-        if hour >= 20 or hour < 6:
-            return "night"
-        return "day"
-    except:
-        return "day"
-
-def calculate_fare_by_type(vehicle_row, distance_km, trip_type, scheduled_time_str=None):
-    slot = get_time_slot(scheduled_time_str)
-    distance_km = float(distance_km)
-    if trip_type == "pool":
-        if slot == "night":
-            rate = float(vehicle_row.get("pool_night_per_km") or vehicle_row.get("pool_per_km") or 8.0)
-        else:
-            rate = float(vehicle_row.get("pool_per_km") or 6.0)
-        min_fare = float(vehicle_row.get("pool_min_fare") or 30.0)
-    elif trip_type == "parcel":
-        if slot == "night":
-            rate = float(vehicle_row.get("parcel_night_per_km") or vehicle_row.get("parcel_per_km") or 10.0)
-        else:
-            rate = float(vehicle_row.get("parcel_per_km") or 8.0)
-        min_fare = float(vehicle_row.get("parcel_min_fare") or 50.0)
-    else:
-        if slot == "night":
-            rate = float(vehicle_row.get("night_fare_per_km") or vehicle_row.get("fare_per_km") or 12.0)
-        else:
-            rate = float(vehicle_row.get("fare_per_km") or 10.0)
-        min_fare = float(vehicle_row.get("min_fare") or 50.0)
-    fare = rate * distance_km
-    if fare < min_fare:
-        fare = min_fare
-    return round(fare, 2), slot, rate
-
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: Dict[int, list[WebSocket]] = {}
-        self.driver_connections: list[dict] = []
-    async def connect(self, ride_id: int, ws: WebSocket):
-        await ws.accept()
-        if ride_id not in self.active_connections: self.active_connections[ride_id] = []
-        self.active_connections[ride_id].append(ws)
-    def disconnect(self, ride_id: int, ws: WebSocket):
-        if ride_id in self.active_connections and ws in self.active_connections[ride_id]: self.active_connections[ride_id].remove(ws)
-    async def broadcast(self, ride_id: int, msg: dict):
-        if ride_id in self.active_connections:
-            for c in list(self.active_connections[ride_id]):
-                try: await c.send_text(json.dumps(msg))
-                except: pass
-    async def connect_driver(self, ws: WebSocket, vehicle_type: str = "", lat: float = None, lng: float = None, driver_range: float = None, driver_id: str = ""):
-        await ws.accept()
-        self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
-        if driver_id:
-            self.driver_connections = [d for d in self.driver_connections if d.get("driver_id")!= driver_id]
-        self.driver_connections.append({"ws": ws, "vehicle_type": vehicle_type.lower().strip(), "lat": lat, "lng": lng, "range": driver_range, "driver_id": driver_id})
-    def disconnect_driver(self, ws: WebSocket):
-        self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
-    async def broadcast_new_ride(self, ride_data: dict):
-        req_type = str(ride_data.get('vehicle_type','')).lower().strip()
-        p_lat = float(ride_data.get('pickup_lat', 0)); p_lng = float(ride_data.get('pickup_lng', 0))
-        dead = []
-        for driver in list(self.driver_connections):
-            ws = driver["ws"]
-            driver_v = str(driver.get("vehicle_type","")).lower().strip()
-            if driver_v and req_type and driver_v!= req_type: continue
-            d_lat = driver.get("lat"); d_lng = driver.get("lng")
-            if d_lat and d_lng:
-                drange = get_range_by_vehicle(driver_v, driver.get("range"))
-                dist = haversine(d_lat, d_lng, p_lat, p_lng)
-                if not is_within_range(drange, dist): continue
-            try: await ws.send_text(json.dumps({"type":"new_ride_alert","ride":ride_data}))
-            except: dead.append(driver)
-        for d in dead:
-            try: self.driver_connections.remove(d)
-            except: pass
-    async def broadcast_ride_taken(self, ride_id: int):
-        dead = []
-        for driver in list(self.driver_connections):
-            try: await driver["ws"].send_text(json.dumps({"type":"ride_taken","ride_id":ride_id}))
-            except: dead.append(driver)
-        for d in dead:
-            try: self.driver_connections.remove(d)
-            except: pass
-
-manager = ConnectionManager()
-
-def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
-    try:
-        if not firebase_admin._apps: return
-        v_type = vehicle_type.strip().lower()
-        all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range").eq("is_online", True).neq("fcm_token", "").execute().data or []
-        tokens = []; p_lat = float(ride_data.get('pickup_lat', 0)); p_lng = float(ride_data.get('pickup_lng', 0))
-        for d in all_drivers:
-            d_v = str(d.get('vehicle_type','')).lower().strip()
-            if d_v!= v_type: continue
-            d_lat = d.get('current_latitude'); d_lng = d.get('current_longitude')
-            if d_lat and d_lng:
-                drange = get_range_by_vehicle(d_v, d.get('range'))
-                dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if not is_within_range(drange, dist): continue
-            if d.get('fcm_token'): tokens.append(d['fcm_token'])
-        tokens = list(set(tokens))
-        if not tokens: return
-        is_parcel = "parcel" in str(ride_data.get('trip_type','')).lower()
-        is_pool = "pool" in str(ride_data.get('trip_type','')).lower()
-        if is_parcel:
-            title = "📦 New Parcel Request!"
-        elif is_pool:
-            title = f"👥 New Pool {vehicle_type} Ride! Seats:{ride_data.get('max_pool_seats',3)}"
-        else:
-            title = f"🔔 New {vehicle_type} Ride Nearby!"
-        body = f"{ride_data.get('pickup_address','')[:45]} -> {ride_data.get('drop_address','')[:30]} | ₹{ride_data.get('fare','')} | {ride_data.get('fare_slot','day')}"
-        android_notif = messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert', default_sound=False)
-        android_config = messaging.AndroidConfig(priority='high', notification=android_notif)
-        apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1)))
-        safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
-        msg = messaging.MulticastMessage(notification=messaging.Notification(title=title, body=body), data={'vehicle_type': v_type, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert', 'fare': str(ride_data.get('fare','')), 'click_action': 'FLUTTER_NOTIFICATION_CLICK', 'sound': 'alert', 'ride_json': json.dumps(safe_ride, default=str)}, tokens=tokens, android=android_config, apns=apns_config)
-        messaging.send_each_for_multicast(msg)
-        print(f"✅ FCM Sent to {len(tokens)} drivers - Type:{v_type}")
-    except Exception as e: print(f"FCM Error {e}")
-
-class RideCreateRequest(BaseModel):
-    pickup_lat: float; pickup_lng: float; drop_lat: float; drop_lng: float
-    pickup_address: Optional[str]=None; drop_address: Optional[str]=None
-    vehicle_type: str="Mini"; distance: float; fare: float
-    scheduled_time: Optional[str]=None; trip_type: str="ride"; otp: str
-
-class DriverLoginRequest(BaseModel):
-    driver_id: Optional[str]=None; phone: Optional[str]=None; password: str; fcm_token: Optional[str]=None
-    mobile: Optional[str]=None; username: Optional[str]=None
-
-class OtpVerifyRequest(BaseModel): otp: str
-class DriverLocationRequest(BaseModel): lat: Optional[float]=None; lng: Optional[float]=None; latitude: Optional[float]=None; longitude: Optional[float]=None
-class PoolDropRequest(BaseModel): driver_id: str
-
-def generate_stringee_token(user_id: str, ride_id: str=""):
-    if not STRINGEE_API_KEY_SID or not STRINGEE_API_KEY_SECRET: return None, None
-    raw = str(user_id).strip()
-    clean_id = raw.replace(" ", "_").replace("+", "").replace("-", "_").lower()
-    clean_id = "".join(c for c in clean_id if c.isalnum() or c == "_")
-    if len(clean_id) < 3: clean_id = f"user_{clean_id}_{uuid.uuid4().hex[:4]}"
-    now = int(time.time())
-    jti = f"{STRINGEE_API_KEY_SID}-{now}-{clean_id}-{ride_id}-{uuid.uuid4().hex[:6]}"
-    payload = {"jti": jti, "iss": STRINGEE_API_KEY_SID, "exp": now+86400*7, "userId": clean_id, "icd": True, "rest_api": True}
-    token = jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256", headers={"cty": "stringee-api;v=1"})
-    return token, clean_id
-
-def archive_and_delete_ride(ride_id: int):
-    try:
-        from supabase import create_client
-        local_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        res = local_supabase.table("rides").select("*").eq("id", ride_id).execute()
-        if not res.data:
-            print(f"Archive: Ride {ride_id} not found - maybe already archived")
-            return
-        ride_data = res.data[0]
-        original_id = ride_data.get('id')
-        ride_data.pop('id', None)
-        ride_data['original_ride_id'] = original_id
-        ride_data['archived_at'] = datetime.now(timezone.utc).isoformat()
-        try:
-            local_supabase.table("rides_archive").insert(ride_data).execute()
-            print(f"✅ Archived: {original_id} - {ride_data.get('status')}")
-        except Exception as arch_e:
-            print(f"Archive insert error {original_id}: {arch_e}")
-            try:
-                minimal = {
-                    "original_ride_id": original_id,
-                    "user_id": ride_data.get('user_id'),
-                    "status": ride_data.get('status'),
-                    "fare": ride_data.get('fare'),
-                    "pickup_address": ride_data.get('pickup_address'),
-                    "drop_address": ride_data.get('drop_address'),
-                    "archived_at": datetime.now(timezone.utc).isoformat(),
-                    "vehicle_type": ride_data.get('vehicle_type'),
-                    "trip_type": ride_data.get('trip_type')
-                }
-                local_supabase.table("rides_archive").insert(minimal).execute()
-                print(f"✅ Archived minimal: {original_id}")
-            except Exception as e2:
-                print(f"Minimal archive fail {original_id}: {e2}")
-                return
-        try: local_supabase.table("rides").delete().eq("id", int(original_id)).execute()
-        except: pass
-        try: supabase.table("rides").delete().eq("id", int(original_id)).execute()
-        except: pass
-        print(f"🗑 Deleted: {original_id}")
-    except Exception as e:
-        print(f"❌ Archive Error {ride_id}: {e}")
-        import traceback; traceback.print_exc()
-
-TIMEOUT_MINUTES = 10
-
-async def auto_timeout_checker():
-    print(f"⏰ Auto Timeout Checker Started - {TIMEOUT_MINUTES} min (UTC Fixed)", flush=True)
-    await asyncio.sleep(5)
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            pending_res = supabase.table("rides").select("id,created_at,scheduled_time,status").eq("status", "pending").limit(100).execute()
-            rides = pending_res.data or []
-            if rides:
-                print(f"⏰ Checking {len(rides)} pending at {now.isoformat()}", flush=True)
-            for r in rides:
-                ride_id = r['id']
-                created_at_str = r.get('created_at')
-                scheduled_str = r.get('scheduled_time')
-                should_timeout = False
-                reason = ""
-                if not scheduled_str or str(scheduled_str).strip() in ["", "null", "None"]:
-                    if created_at_str:
-                        try:
-                            created_dt = datetime.fromisoformat(str(created_at_str).replace('Z','+00:00'))
-                            if created_dt.tzinfo is None:
-                                created_dt = created_dt.replace(tzinfo=timezone.utc)
-                            diff_min = (now - created_dt).total_seconds() / 60
-                            if diff_min >= TIMEOUT_MINUTES:
-                                should_timeout = True
-                                reason = f"Normal timeout {diff_min:.1f}min"
-                        except Exception as e:
-                            print(f" Parse error {ride_id}: {e} - {created_at_str}", flush=True)
-                else:
-                    try:
-                        sched_dt = datetime.fromisoformat(str(scheduled_str).replace('Z','+00:00'))
-                        if sched_dt.tzinfo is None:
-                            sched_dt = sched_dt.replace(tzinfo=timezone.utc)
-                        timeout_at = sched_dt - timedelta(minutes=TIMEOUT_MINUTES)
-                        if now >= timeout_at:
-                            should_timeout = True
-                            reason = f"Scheduled timeout - sched {sched_dt}"
-                    except Exception as e:
-                        print(f" Sched parse error {ride_id}: {e} - {scheduled_str}", flush=True)
-                if should_timeout:
-                    print(f"⏰ TIMING OUT {ride_id} - {reason}", flush=True)
-                    try:
-                        supabase.table("rides").update({"status": "timeout"}).eq("id", ride_id).execute()
-                        archive_and_delete_ride(ride_id)
-                        await manager.broadcast_ride_taken(ride_id)
-                    except Exception as e:
-                        print(f"Timeout fail {ride_id}: {e}", flush=True)
-        except Exception as e:
-            print(f"Checker error: {e}", flush=True)
-        await asyncio.sleep(30)
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(auto_timeout_checker())
-    print("✅ Rivo API Started - Range From DB Only - Full 581 + Pool")
-
-@app.get("/admin/check-timeout-now")
-async def check_timeout_now():
-    now = datetime.now(timezone.utc)
-    pending = supabase.table("rides").select("id,created_at,scheduled_time").eq("status", "pending").execute().data or []
-    result = []
-    for r in pending:
-        try:
-            c_str = r.get('created_at')
-            c_dt = datetime.fromisoformat(str(c_str).replace('Z','+00:00')) if c_str else None
-            if c_dt and c_dt.tzinfo is None: c_dt = c_dt.replace(tzinfo=timezone.utc)
-            diff = (now - c_dt).total_seconds()/60 if c_dt else 0
-            result.append({"id": r['id'], "created_at": c_str, "age_min": round(diff,2), "scheduled": r.get('scheduled_time'), "should_timeout": diff >= TIMEOUT_MINUTES and not r.get('scheduled_time')})
-        except Exception as e:
-            result.append({"id": r['id'], "error": str(e), "created": r.get('created_at')})
-    return {"now_utc": now.isoformat(), "timeout_minutes": TIMEOUT_MINUTES, "pending_count": len(result), "rides": result}
-
-@app.put("/rides/{ride_id}/complete")
-def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
-    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat(), "passenger_status": "dropped"}).eq("id",ride_id).execute()
-    background_tasks.add_task(archive_and_delete_ride, ride_id)
-    return {"success":True}
-
-@app.put("/rides/{ride_id}/drop-passenger")
-def drop_passenger(ride_id: int, payload: PoolDropRequest, background_tasks: BackgroundTasks):
-    res = supabase.table("rides").select("*").eq("id", ride_id).execute()
-    if not res.data: raise HTTPException(404, "Ride नहीं मिली")
-    ride = res.data[0]
-    supabase.table("rides").update({"passenger_status": "dropped", "status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id).execute()
-    background_tasks.add_task(archive_and_delete_ride, ride_id)
-    gid = ride.get("pool_group_id")
-    if gid:
-        remaining = supabase.table("rides").select("id").eq("pool_group_id", gid).neq("status","completed").execute().data or []
-        return {"success": True, "group_completed": len(remaining)==0, "remaining": len(remaining)}
-    return {"success": True, "group_completed": True}
-
-@app.put("/rides/{ride_id}/cancel")
-def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
-    supabase.table("rides").update({"status": "cancelled"}).eq("id", ride_id).execute()
-    try:
-        background_tasks.add_task(archive_and_delete_ride, ride_id)
-    except:
-        pass
-    return {"success": True}
-
-@app.put("/rides/{ride_id}/timeout")
-def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
-    supabase.table("rides").update({"status":"timeout"}).eq("id", ride_id).execute()
-    background_tasks.add_task(archive_and_delete_ride, ride_id)
-    return {"success": True}
-
-@app.post("/drivers/login")
-def driver_login(payload: DriverLoginRequest):
-    try:
-        raw_input = payload.phone or payload.mobile or payload.driver_id or payload.username or ""
-        password_input = payload.password or ""
-        driver_input = str(raw_input).strip()
-        password_input = str(password_input).strip()
-        print(f"LOGIN TRY: {driver_input}")
-        if not driver_input: raise HTTPException(status_code=400, detail="Phone/ID required")
-        res = supabase.table("drivers").select("*").or_(f"id.ilike.{driver_input},driver_id.ilike.{driver_input},phone.eq.{driver_input}").limit(1).execute()
-        if not res.data: res = supabase.table("drivers").select("*").ilike("id", driver_input).limit(1).execute()
-        if not res.data: res = supabase.table("drivers").select("*").ilike("driver_id", driver_input).limit(1).execute()
-        if not res.data: res = supabase.table("drivers").select("*").eq("phone", driver_input).limit(1).execute()
-        if not res.data:
-            try: res = supabase.table("drivers").select("*").eq("mobile", driver_input).limit(1).execute()
-            except: pass
-        if not res.data: raise HTTPException(status_code=404, detail="Driver not found")
-        driver = res.data[0]
-        if str(driver.get('password','')).strip()!= password_input: raise HTTPException(status_code=401, detail="Wrong password")
-        if payload.fcm_token:
-            try: supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", driver["id"]).execute()
-            except: pass
-        return driver
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/maps/directions")
-async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)):
-    try:
-        if not GOOGLE_MAPS_API_KEY: raise HTTPException(status_code=500, detail="GOOGLE_MAPS_API_KEY not set")
-        url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={dest}&key={GOOGLE_MAPS_API_KEY}&language=en&overview=full"
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(url)
-            data = r.json()
-            if data.get("status") == "OK":
-                route = data["routes"][0]; leg = route["legs"][0]
-                return {"points": route["overview_polyline"]["points"], "distance_text": leg["distance"]["text"], "distance_value": leg["distance"]["value"], "duration_text": leg["duration"]["text"]}
-            else: raise HTTPException(status_code=400, detail=f"Google: {data.get('status')}")
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/drivers/{driver_id}/location")
-async def update_driver_location(driver_id: str, payload: DriverLocationRequest):
-    lat = payload.latitude if payload.latitude is not None else payload.lat
-    lng = payload.longitude if payload.longitude is not None else payload.lng
-    if lat is None or lng is None:
-        raise HTTPException(status_code=400, detail="lat/lng required")
-    d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("id", driver_id).execute()
-    if not d_res.data:
-        d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("driver_id", driver_id).execute()
-    if not d_res.data:
-        raise HTTPException(status_code=404, detail="Driver not found")
-    real_id = d_res.data[0]["id"]
-    driver_range = get_range_by_vehicle(d_res.data[0].get("vehicle_type"), d_res.data[0].get("range"))
-    d_vehicle = str(d_res.data[0].get("vehicle_type","")).lower()
-    supabase.table("drivers").update({
-        "current_latitude": lat,
-        "current_longitude": lng,
-        "last_seen": datetime.now(timezone.utc).isoformat(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "is_online": True
-    }).eq("id", real_id).execute()
-    for d in manager.driver_connections:
-        if d.get("driver_id") == driver_id or d.get("driver_id") == real_id:
-            d["lat"] = lat
-            d["lng"] = lng
-    nearby_rides = []
-    try:
-        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(30)
-        if d_vehicle:
-            q = q.eq("vehicle_type", d_vehicle)
-        pending_rides = q.execute().data or []
-        for ride in pending_rides:
-            try:
-                p_lat = float(ride.get("pickup_lat", 0))
-                p_lng = float(ride.get("pickup_lng", 0))
-                if p_lat == 0 or p_lng == 0:
-                    continue
-                dist = haversine(lat, lng, p_lat, p_lng)
-                if is_within_range(driver_range, dist):
-                    ride["distance_from_driver"] = round(dist, 2)
-                    ride["driver_range"] = driver_range if driver_range is not None else 999
-                    ride.pop("otp", None)
-                    nearby_rides.append(ride)
-            except:
-                continue
-        nearby_rides.sort(key=lambda x: x.get("distance_from_driver", 999))
-        if nearby_rides:
-            for conn in list(manager.driver_connections):
-                if conn.get("driver_id") == driver_id or conn.get("driver_id") == real_id:
-                    try:
-                        await conn["ws"].send_text(json.dumps({
-                            "type": "nearby_rides_update",
-                            "rides": nearby_rides,
-                            "count": len(nearby_rides)
-                        }))
-                    except:
-                        pass
-            print(f"📍 Driver {driver_id} entered range - Sent {len(nearby_rides)} rides")
-    except Exception as e:
-        print(f"Nearby check error: {e}")
-    try:
-        supabase.table("rides").update({"driver_lat": lat, "driver_lng": lng}).eq("driver_id", real_id).in_("status", ["accepted", "started"]).execute()
-    except:
-        pass
-    return {"success": True, "nearby_rides_count": len(nearby_rides)}
-
-@app.get("/rides/pending/list")
-def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
-    try:
-        if not driver_id: raise HTTPException(status_code=400, detail="driver_id required")
-        d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("id", driver_id).execute()
-        if not d_res.data: d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("driver_id", driver_id).execute()
-        if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
-        drv = d_res.data[0]
-        d_lat = driver_lat if driver_lat is not None else drv.get("current_latitude")
-        d_lng = driver_lng if driver_lng is not None else drv.get("current_longitude")
-        d_vehicle = (vehicle_type or drv.get("vehicle_type") or "").strip()
-        driver_range = get_range_by_vehicle(d_vehicle, drv.get("range"))
-        q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(50)
-        if d_vehicle: q = q.eq("vehicle_type", d_vehicle)
-        res = q.execute()
-        rides = res.data or []
-        if d_lat is None or d_lng is None:
-            for r in rides: r.pop("otp", None)
-            return rides
-        filtered = []
-        for ride in rides:
-            try:
-                p_lat = float(ride.get("pickup_lat", 0)); p_lng = float(ride.get("pickup_lng", 0))
-                if p_lat == 0 or p_lng == 0: continue
-                dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if driver_range is None or dist <= float(driver_range):
-                    ride["distance_from_driver"] = round(dist, 2)
-                    ride["driver_range"] = driver_range if driver_range is not None else 999
-                    ride.pop("otp", None)
-                    filtered.append(ride)
-            except: continue
-        filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
-        return filtered
-    except HTTPException: raise
-    except Exception as e: print(f"Pending Error: {e}"); return []
-
-@app.get("/vehicles")
-def get_vehicles():
-    try:
-        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, pool_per_km, pool_night_per_km, pool_min_fare, max_pool_seats, icon_path").order("id", desc=False).execute()
-        return res.data or []
-    except: return []
-
-@app.get("/rides/{ride_id}")
-def get_ride(ride_id: int):
-    res = supabase.table("rides").select("*").eq("id", ride_id).execute()
-    if not res.data: raise HTTPException(status_code=404, detail="Ride not found")
-    ride = res.data[0]
-    try:
-        rider_base_id = ride.get("stringee_user_id") or ride.get("user_id")
-        new_rider_token, rider_cid = generate_stringee_token(rider_base_id, str(ride_id))
-        update_data = {"stringee_token": new_rider_token, "stringee_user_id": rider_cid}
-        ride["stringee_token"] = new_rider_token; ride["stringee_user_id"] = rider_cid
-        if ride.get("driver_id"):
-            driver_base_id = ride.get("driver_stringee_user_id") or ride.get("driver_id")
-            new_driver_token, driver_cid = generate_stringee_token(driver_base_id, str(ride_id))
-            update_data["driver_stringee_token"] = new_driver_token; update_data["driver_stringee_user_id"] = driver_cid
-            ride["driver_stringee_token"] = new_driver_token; ride["driver_stringee_user_id"] = driver_cid
-        supabase.table("rides").update(update_data).eq("id", ride_id).execute()
-    except: pass
-    return ride
-
-@app.get("/rides/ongoing/{user_id}")
-def get_ongoing(user_id: str):
-    res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived"]).order("id", desc=True).limit(1).execute()
-    if not res.data: return None
-    return res.data[0]
-
-@app.post("/rides")
-async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
-    token, clean_id = generate_stringee_token(user_id, "new")
-    raw_type = str(payload.trip_type).lower()
-    final_trip = "parcel" if "parcel" in raw_type else "pool" if "pool" in raw_type else "ride"
-    v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).limit(1).execute()
-    if not v_res.data: v_res = supabase.table("vehicles").select("*").limit(1).execute()
-    vehicle_row = v_res.data[0] if v_res.data else {}
-    correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
-    max_seats = int(vehicle_row.get("max_pool_seats") or 3)
-    pool_group_id = None
-    is_pool = False
-    if final_trip == "pool":
-        is_pool = True
-        try:
-            active_pools = supabase.table("rides").select("pool_group_id, vehicle_type").eq("trip_type","pool").in_("status",["accepted","started"]).eq("vehicle_type", payload.vehicle_type).limit(20).execute().data or []
-            found_group = None
-            for p in active_pools:
-                gid = p.get("pool_group_id")
-                if not gid: continue
-                cnt_res = supabase.table("rides").select("id", count="exact").eq("pool_group_id", gid).in_("status",["accepted","started"]).in_("passenger_status",["waiting","onboard"]).execute()
-                cnt = cnt_res.count or 0
-                if cnt < max_seats:
-                    found_group = gid
-                    break
-            pool_group_id = found_group if found_group else f"POOL_{uuid.uuid4().hex[:6].upper()}"
-        except: pool_group_id = f"POOL_{uuid.uuid4().hex[:6].upper()}"
-    ride_data = {
-        "user_id": user_id,
-        "pickup_lat": payload.pickup_lat, "pickup_lng": payload.pickup_lng,
-        "drop_lat": payload.drop_lat, "drop_lng": payload.drop_lng,
-        "pickup_address": payload.pickup_address, "drop_address": payload.drop_address,
-        "vehicle_type": payload.vehicle_type, "distance": payload.distance, "fare": correct_fare,
-        "trip_type": final_trip, "status": "pending", "otp": payload.otp,
-        "city": "", "country": "", "currency": "INR",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "scheduled_time": payload.scheduled_time,
-        "stringee_token": token, "stringee_user_id": clean_id,
-        "pool_group_id": pool_group_id, "is_pool_ride": is_pool,
-        "passenger_status": "waiting" if is_pool else None,
-        "fare_slot": slot, "fare_rate": rate,
-        "max_pool_seats": max_seats if is_pool else None
+  static Future<void> showAlert({String? rideVehicleType, String? rideCategory, String? currency, int? seatsBooked, int? totalSeats}) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      String myVehicle = prefs.getString('vehicle_type')?? '';
+      if (rideVehicleType!= null && rideVehicleType.isNotEmpty && myVehicle.isNotEmpty) {
+        if (rideVehicleType.toLowerCase()!= myVehicle.toLowerCase()) return;
+      }
+      String type = (rideCategory?? '').toLowerCase();
+      String title;
+      String body;
+      String curr = currency?? '₹';
+      String seatInfo = "";
+      if(type.contains('pool') && totalSeats!= null){
+        seatInfo = " ${seatsBooked??1}/${totalSeats} Seats";
+      }
+      if (type.contains('pool')) {
+        title = '👥 POOL ${rideVehicleType?? ''}$seatInfo - SHARED';
+        body = 'New Pool ride nearby$seatInfo - $curr - ${rideVehicleType?? ''}';
+      } else if (type.contains('parcel') || type.contains('courier')) {
+        title = '📦 PARCEL ${rideVehicleType?? ''}!';
+        body = 'New Parcel nearby - $curr';
+      } else {
+        title = '🚗 RIDE ${rideVehicleType?? ''}!';
+        body = 'New ride nearby - $curr';
+      }
+      final androidDetails = AndroidNotificationDetails(
+        AppConstants.notifChannelId,
+        AppConstants.notifChannelName,
+        importance: Importance.max,
+        priority: Priority.high,
+        sound: const RawResourceAndroidNotificationSound('alert'),
+        playSound: true,
+        enableVibration: true,
+        styleInformation: BigTextStyleInformation(body),
+      );
+      await _notif.show(
+        DateTime.now().millisecond,
+        title,
+        body,
+        NotificationDetails(android: androidDetails),
+      );
+    } catch (e) {
+      print("Notif error $e");
     }
-    res = supabase.table("rides").insert(ride_data).execute()
-    if not res.data: raise HTTPException(status_code=500, detail="Failed")
-    new_ride = res.data[0]
-    await manager.broadcast_new_ride(new_ride)
-    send_fcm_global(new_ride, payload.vehicle_type)
-    return new_ride
+  }
+}
 
-@app.put("/rides/{ride_id}/accept")
-async def accept_ride(ride_id: int, driver_id: str=Query(...)):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id",driver_id).execute()
-    if not d_res.data: d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id",driver_id).execute()
-    if not d_res.data: raise HTTPException(status_code=404, detail="Driver not found")
-    driver = d_res.data[0]
-    ride_res = supabase.table("rides").select("user_id,stringee_user_id").eq("id", ride_id).execute()
-    if not ride_res.data: raise HTTPException(status_code=404, detail="Ride not found")
-    old_rider_user_id = ride_res.data[0].get("stringee_user_id") or ride_res.data[0].get("user_id")
-    new_rider_token, rider_clean_id = generate_stringee_token(old_rider_user_id, str(ride_id))
-    new_driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
-    ride_update = {"driver_id": driver["id"], "status": "accepted", "driver_name": driver.get("name"), "driver_phone": driver.get("phone"), "vehicle_number": driver.get("vehicle_number"), "vehicle_type": driver.get("vehicle_type"), "stringee_token": new_rider_token, "stringee_user_id": rider_clean_id, "driver_stringee_token": new_driver_token, "driver_stringee_user_id": driver_clean_id, "accepted_at": datetime.now(timezone.utc).isoformat()}
-    updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
-    if not updated.data: raise HTTPException(status_code=409, detail="Already taken")
-    await manager.broadcast_ride_taken(ride_id)
-    return {"success":True, "ride":updated.data[0], "stringee_token": new_driver_token, "driver_token": new_driver_token, "rider_token": new_rider_token, "driver_user_id": driver_clean_id, "rider_user_id": rider_clean_id}
+class ApiService {
+  static Future<void> updateDriverLocation({required String driverId, required double lat, required double lng}) async {
+    if (driverId.isEmpty) return;
+    try {
+      final url = Uri.parse('${AppConstants.baseUrl}/drivers/$driverId/location');
+      await http.put(url, headers: {'Content-Type': 'application/json'}, body: json.encode({"latitude": lat, "longitude": lng})).timeout(const Duration(seconds: 5));
+    } catch (e) {}
+  }
 
-@app.post("/rides/{ride_id}/verify-otp")
-def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
-    res = supabase.table("rides").select("id,otp,status").eq("id", ride_id).execute()
-    if not res.data: raise HTTPException(status_code=404, detail="Ride not found")
-    ride = res.data[0]
-    if ride["status"] == "started": return {"success": True}
-    if str(ride.get("otp","")).strip()!= str(payload.otp).strip(): raise HTTPException(status_code=400, detail="Galat OTP")
-    supabase.table("rides").update({"status": "started","started_at": datetime.now(timezone.utc).isoformat(), "passenger_status": "onboard"}).eq("id", ride_id).execute()
-    return {"success": True}
+  static Future<Map<String, dynamic>?> getRouteFromBackend({required LatLng origin, required LatLng dest}) async {
+    try {
+      final url = Uri.parse('${AppConstants.baseUrl}/maps/directions?origin=${origin.latitude},${origin.longitude}&dest=${dest.latitude},${dest.longitude}');
+      final res = await http.get(url).timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        var body = json.decode(res.body);
+        if (body['points']!= null && body['points'].toString().isNotEmpty) {
+          return body;
+        }
+      }
+    } catch (e) {}
+    try {
+      String googleKey = dotenv.env['GOOGLE_MAPS_API_KEY']?? "";
+      if (googleKey.isEmpty) return null;
+      final gUrl = Uri.parse('https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}&destination=${dest.latitude},${dest.longitude}&key=$googleKey');
+      final res = await http.get(gUrl).timeout(const Duration(seconds: 10));
+      if (res.statusCode == 200) {
+        var data = json.decode(res.body);
+        if (data['status'] == 'OK' && data['routes'].isNotEmpty) {
+          var route = data['routes'][0];
+          var leg = route['legs'][0];
+          return {
+            "points": route['overview_polyline']['points'],
+            "distance_text": leg['distance']['text'],
+            "duration_text": leg['duration']['text'],
+          };
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+}
 
-@app.get("/drivers/{driver_id}/active-ride")
-def get_active_ride(driver_id: str):
-    res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(10).execute()
-    if not res.data:
-        d = supabase.table("drivers").select("id").eq("driver_id", driver_id).execute()
-        if d.data: res = supabase.table("rides").select("*").eq("driver_id", d.data[0]["id"]).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(10).execute()
-    if res.data: return {"active": True, "rides": res.data, "ride": res.data[0]}
-    return {"active": False, "rides": [], "ride": None}
+@pragma('vm:entry-point')
+Future<void> _firebaseBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  try {
+    String? rideVehicle = message.data['vehicle_type']?.toString();
+    String? category = message.data['trip_type']?.toString();
+    int? booked = int.tryParse(message.data['seats_booked']?.toString()?? "1");
+    int? total = int.tryParse(message.data['total_seats']?.toString()?? "3");
+    final prefs = await SharedPreferences.getInstance();
+    String myVehicle = prefs.getString('vehicle_type')?? '';
+    if (rideVehicle!= null && rideVehicle.isNotEmpty && myVehicle.isNotEmpty) {
+      if (rideVehicle.toLowerCase()!= myVehicle.toLowerCase()) return;
+    }
+    await NotificationService.init();
+    await NotificationService.showAlert(rideVehicleType: rideVehicle, rideCategory: category, seatsBooked: booked, totalSeats: total);
+  } catch (e) {}
+}
 
-@app.websocket("/ws/drivers")
-async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = Query(None), lng: float = Query(None), driver_id: str = Query(None)):
-    drange = None
-    if driver_id:
-        try:
-            d_res = supabase.table("drivers").select("range, vehicle_type").eq("id", driver_id).execute()
-            if not d_res.data: d_res = supabase.table("drivers").select("range, vehicle_type").eq("driver_id", driver_id).execute()
-            if d_res.data:
-                drange = get_range_by_vehicle(d_res.data[0].get("vehicle_type"), d_res.data[0].get("range"))
-                if not vehicle_type: vehicle_type = d_res.data[0].get("vehicle_type","")
-        except: pass
-    await manager.connect_driver(ws, vehicle_type, lat, lng, drange, driver_id)
-    try:
-        while True: await ws.receive_text()
-    except WebSocketDisconnect: manager.disconnect_driver(ws)
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  await dotenv.load(fileName: ".env");
+  await NotificationService.init();
+  FirebaseMessaging.onBackgroundMessage(_firebaseBackgroundHandler);
+  runApp(const MyApp());
+}
 
-@app.websocket("/ws/ride/{ride_id}")
-async def ws_ride(ws: WebSocket, ride_id: int):
-    await manager.connect(ride_id, ws)
-    try:
-        while True: await ws.receive_text()
-    except WebSocketDisconnect: manager.disconnect(ride_id, ws)
+class StringeeService {
+  static StringeeClient? _client;
+  static StringeeCall? _call;
+  static bool _isConnected = false;
+  static String? _lastToken;
+  static Completer<bool>? _connectionCompleter;
+  static StreamSubscription? _clientSub;
+  static StreamSubscription? _callSub;
+  static Function(String state)? onSignalingStateChanged;
+  static Function(StringeeCall)? onIncomingCall;
+  static bool get isConnected => _isConnected;
 
-@app.get("/")
-def root(): return {"status":"Rivo API 16.0 - Full 581+ Pool Vehicle Seats - All Options OK"}
+  static Future<bool> connectWithToken(String? token) async {
+    if (token == null || token.isEmpty || token == "null") return false;
+    if (_isConnected && _client!= null && _lastToken == token) return true;
+    if (_lastToken!= null && _lastToken!= token) await disconnect();
+    if (_connectionCompleter!= null &&!_connectionCompleter!.isCompleted) {
+      _connectionCompleter!.complete(false);
+    }
+    _connectionCompleter = Completer<bool>();
+    _lastToken = token;
+    _clientSub?.cancel();
+    _client = StringeeClient();
+    _clientSub = _client?.eventStreamController.stream.listen((event) {
+      var map = event;
+      switch (map['eventType']) {
+        case StringeeClientEvents.didConnect:
+          _isConnected = true;
+          if (!(_connectionCompleter!.isCompleted)) _connectionCompleter!.complete(true);
+          break;
+        case StringeeClientEvents.didDisconnect:
+        case StringeeClientEvents.didFailWithError:
+          _isConnected = false;
+          if (!(_connectionCompleter!.isCompleted)) _connectionCompleter!.complete(false);
+          break;
+        case StringeeClientEvents.incomingCall:
+          _call = map['body'];
+          _listenToCallEvents();
+          if (onIncomingCall!= null) onIncomingCall!(_call!);
+          break;
+      }
+    });
+    _client?.connect(token);
+    return _connectionCompleter!.future.timeout(const Duration(seconds: 15), onTimeout: () {
+      _isConnected = false;
+      return false;
+    });
+  }
 
-@app.get("/admin/archived")
-def get_archived():
-    try: res = supabase.table("rides_archive").select("*").order("archived_at", desc=True).limit(100).execute(); return res.data
-    except Exception as e: return {"error": str(e)}
+  static void _listenToCallEvents() {
+    _callSub?.cancel();
+    _callSub = _call?.eventStreamController.stream.listen((event) {
+      if (event['eventType'] == StringeeCallEvents.didChangeSignalingState && onSignalingStateChanged!= null) {
+        onSignalingStateChanged!(event['body'].toString());
+      }
+    });
+  }
+
+  static void makeCall(String toUserId) {
+    if (!_isConnected || _client == null) {
+      onSignalingStateChanged?.call("not_connected");
+      return;
+    }
+    _call = StringeeCall(_client!);
+    _listenToCallEvents();
+    _call?.makeCall({'from': _client?.userId, 'to': toUserId, 'isVideoCall': false});
+  }
+
+  static void answerCall() { _call?.initAnswer(); _call?.answer(); }
+  static void rejectCall() { _call?.reject(); _call = null; }
+  static void hangup() { _call?.hangup(); _call = null; }
+  static Future<void> disconnect() async {
+    _callSub?.cancel();
+    _clientSub?.cancel();
+    _client?.disconnect();
+    _isConnected = false;
+    _lastToken = null;
+    _connectionCompleter = null;
+    await Future.delayed(const Duration(milliseconds: 400));
+  }
+}
+
+class LocationHelper {
+  static Future<Position?> getCurrentLocation() async {
+    bool serviceEnabled = await Geolocator.isLocationServiceEnabled(); if (!serviceEnabled) return null;
+    LocationPermission permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) { permission = await Geolocator.requestPermission(); if (permission == LocationPermission.denied) return null; }
+    if (permission == LocationPermission.deniedForever) return null;
+    return await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+  }
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+  @override Widget build(BuildContext context) { return MaterialApp(debugShowCheckedModeBanner: false, theme: ThemeData(primarySwatch: Colors.green), home: const SplashScreen()); }
+}
+
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+  @override State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen> {
+  @override void initState() { super.initState(); _checkLogin(); }
+  Future<void> _checkLogin() async {
+    final prefs = await SharedPreferences.getInstance();
+    bool isLoggedIn = prefs.getBool('isLoggedIn')?? false;
+    String? driverId = prefs.getString('driverId'); String? driverName = prefs.getString('driverName');
+    if (isLoggedIn && driverId!= null) {
+      try {
+        final res = await http.get(Uri.parse('${AppConstants.baseUrl}/drivers/$driverId/active-ride')).timeout(const Duration(seconds: 15));
+        if (res.statusCode == 200) {
+          final data = json.decode(res.body);
+          if (data['active'] == true && data['ride']!= null) {
+            if (!mounted) return;
+            Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => DriverDashboard(driverId: driverId, driverName: driverName?? 'Driver', initialRide: data['ride']))); return;
+          }
+        }
+      } catch (_) {}
+      if (!mounted) return;
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => DriverDashboard(driverId: driverId, driverName: driverName?? 'Driver')));
+    } else {
+      if (!mounted) return;
+      Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginScreen()));
+    }
+  }
+  @override Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+  @override State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _idController = TextEditingController(text: "");
+  final _passController = TextEditingController(text: "");
+  bool _loading = false;
+  Future<String?> _getFcmToken() async {
+    try {
+      await FirebaseMessaging.instance.requestPermission(alert: true, sound: true, badge: true);
+      return await FirebaseMessaging.instance.getToken();
+    } catch (e) { return null; }
+  }
+  Future<void> _login() async {
+    if (_idController.text.trim().isEmpty || _passController.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('ID और Password दोनों डालो')));
+      return;
+    }
+    setState(() => _loading = true);
+    try {
+      String? fcmToken = await _getFcmToken();
+      final res = await http.post(Uri.parse('${AppConstants.baseUrl}/drivers/login'), headers: {'Content-Type': 'application/json'}, body: json.encode({"driver_id": _idController.text.trim(), "phone": _idController.text.trim(), "mobile": _idController.text.trim(), "password": _passController.text.trim(), "fcm_token": fcmToken})).timeout(const Duration(seconds: 90));
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body);
+        final driver = data.containsKey('driver')? data['driver'] : data;
+        if (driver == null || driver['id'] == null) throw Exception("Invalid driver data");
+        String dName = driver['name']?.toString()?? driver['id']?.toString()?? 'Driver';
+        String dId = driver['id']?.toString()?? _idController.text.trim();
+        double dRange = double.tryParse(driver['range'].toString())?? 20.0;
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool('isLoggedIn', true);
+        await prefs.setString('driverId', dId);
+        await prefs.setString('driverName', dName);
+        await prefs.setString('vehicle_type', driver['vehicle_type']?.toString()?? 'Car');
+        await prefs.setDouble('driver_range', dRange);
+        if (fcmToken!= null) await prefs.setString('fcm_token', fcmToken);
+        if (!mounted) return;
+        Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => DriverDashboard(driverId: dId, driverName: dName)));
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Login Fail: ${res.body}')));
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+  @override Widget build(BuildContext context) {
+    return Scaffold(appBar: AppBar(title: const Text('Driver Login'), backgroundColor: Colors.green), body: Padding(padding: const EdgeInsets.all(20), child: Column(children: [TextField(controller: _idController, decoration: const InputDecoration(labelText: 'Driver ID', hintText: 'Enter ID e.g. car1', border: OutlineInputBorder(), prefixIcon: Icon(Icons.person))), const SizedBox(height: 12), TextField(controller: _passController, obscureText: true, decoration: const InputDecoration(labelText: 'Password', hintText: 'Enter password', border: OutlineInputBorder(), prefixIcon: Icon(Icons.lock))), const SizedBox(height: 20), SizedBox(width: double.infinity, child: ElevatedButton(onPressed: _loading? null : _login, style: ElevatedButton.styleFrom(backgroundColor: Colors.green, padding: const EdgeInsets.symmetric(vertical: 14)), child: _loading? const CircularProgressIndicator(color: Colors.white) : const Text('Login', style: TextStyle(color: Colors.white, fontSize: 16))))])));
+  }
+}
+
+class DriverDashboard extends StatefulWidget {
+  final String driverId, driverName; final Map<String, dynamic>? initialRide;
+  const DriverDashboard({super.key, required this.driverId, required this.driverName, this.initialRide});
+  @override State<DriverDashboard> createState() => _DriverDashboardState();
+}
+
+class _DriverDashboardState extends State<DriverDashboard> {
+  List _pending = [];
+  Map<String, dynamic>? _activeRide;
+  String _callStatus = "Idle";
+  WebSocketChannel? _wsChannel;
+  bool _loading = true;
+  double _myRange = 20.0;
+  final _otpController = TextEditingController();
+  bool _isOtpVerified = false;
+  bool _isVerifying = false;
+  StreamSubscription<Position>? _locationStream;
+  Set<int> _alreadyNotifiedIds = {};
+
+  @override void initState() {
+    super.initState();
+    _loadRangeFromPrefs();
+    if (widget.initialRide!= null) {
+      _activeRide = widget.initialRide;
+      if (_activeRide!['status'] == 'started') _isOtpVerified = true;
+      _loading = false;
+      _connectStringeeFromRide();
+    } else {
+      _fetchActiveRide();
+    }
+    _fetchPendingWithRangeCheck();
+    _connectWsGlobal();
+    _initFcmListeners();
+    _startLiveTracking();
+    StringeeService.onIncomingCall = (call) {
+      if (!mounted) return;
+      _notif.cancel(1);
+      showDialog(context: context, barrierDismissible: false, builder: (ctx) => AlertDialog(shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)), title: const Text("📞 User Call"), content: const Text("User calling you"), actions: [TextButton(onPressed: () { StringeeService.rejectCall(); Navigator.pop(ctx); setState(() => _callStatus = "Rejected"); }, child: const Text("Cut", style: TextStyle(color: Colors.red, fontSize: 18))), ElevatedButton(onPressed: () { StringeeService.answerCall(); Navigator.pop(ctx); setState(() => _callStatus = "✅ Connected"); }, style: ElevatedButton.styleFrom(backgroundColor: Colors.green), child: const Text("Answer", style: TextStyle(color: Colors.white)))]));
+    };
+    StringeeService.onSignalingStateChanged = (state) { if (mounted) setState(() => _callStatus = state); };
+  }
+
+  Future<void> _connectStringeeFromRide() async {
+    String? token = _activeRide?['driver_stringee_token']?.toString();
+    if (token!= null && token.isNotEmpty) await StringeeService.connectWithToken(token);
+  }
+
+  Future<void> _loadRangeFromPrefs() async { final prefs = await SharedPreferences.getInstance(); double r = prefs.getDouble('driver_range')?? 20.0; if (mounted) setState(() => _myRange = r); }
+
+  void _startLiveTracking() {
+    _locationStream = Geolocator.getPositionStream(locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 20)).listen((pos) {
+      ApiService.updateDriverLocation(driverId: widget.driverId, lat: pos.latitude, lng: pos.longitude);
+      _fetchPendingWithRangeCheck();
+    });
+  }
+
+  void _initFcmListeners() {
+    FirebaseMessaging.onMessage.listen((message) async {
+      String? vType = message.data['vehicle_type']?.toString();
+      String? category = message.data['trip_type']?.toString()?? message.data['type']?.toString()?? message.data['category']?.toString();
+      int? booked = int.tryParse(message.data['seats_booked']?.toString()?? "1");
+      int? total = int.tryParse(message.data['total_seats']?.toString()?? "3");
+      await NotificationService.showAlert(rideVehicleType: vType, rideCategory: category, seatsBooked: booked, totalSeats: total);
+      _fetchPendingWithRangeCheck();
+    });
+    FirebaseMessaging.onMessageOpenedApp.listen((message) { _fetchPendingWithRangeCheck(); });
+  }
+
+  void _connectWsGlobal() async {
+    try {
+      final prefs = await SharedPreferences.getInstance(); String vType = prefs.getString('vehicle_type')?? ''; var pos = await LocationHelper.getCurrentLocation(); String lat = pos?.latitude.toString()?? ''; String lng = pos?.longitude.toString()?? ''; final wsUrl = AppConstants.baseUrl.replaceFirst('https://', 'wss://') + '/ws/drivers?vehicle_type=$vType&lat=$lat&lng=$lng&driver_id=${widget.driverId}'; _wsChannel = WebSocketChannel.connect(Uri.parse(wsUrl)); _wsChannel!.stream.listen((msg) async { final data = json.decode(msg); if (data['type'] == 'new_ride_alert') { String? vType = data['ride']?['vehicle_type']?.toString()?? data['vehicle_type']?.toString(); String? category = data['ride']?['trip_type']?.toString()?? data['type']?.toString()?? data['category']?.toString(); String? currency = data['ride']?['currency']?.toString()?? '₹'; int? booked = int.tryParse(data['ride']?['seats_booked']?.toString()?? "1"); int? total = int.tryParse(data['ride']?['total_seats']?.toString()?? data['ride']?['max_pool_seats']?.toString()?? "3"); await NotificationService.showAlert(rideVehicleType: vType, rideCategory: category, currency: currency, seatsBooked: booked, totalSeats: total); _fetchPendingWithRangeCheck(); } else if (data['type'] == 'ride_taken') { int takenId = int.tryParse(data['ride_id'].toString())?? -1; if (mounted) { setState(() { _pending.removeWhere((r) => r['id'] == takenId); }); } try { await _notif.cancel(takenId); } catch (_) {} } }, onDone: () { Future.delayed(const Duration(seconds: 5), _connectWsGlobal); }, onError: (e) { Future.delayed(const Duration(seconds: 5), _connectWsGlobal); });
+    } catch (e) {}
+  }
+
+  Future<void> _fetchActiveRide() async { try { final res = await http.get(Uri.parse('${AppConstants.baseUrl}/drivers/${widget.driverId}/active-ride')).timeout(const Duration(seconds: 15)); if (res.statusCode == 200) { final data = json.decode(res.body); if (data['active'] == true && data['ride']!= null) { if (mounted) setState(() { _activeRide = data['ride']; if (_activeRide!['status'] == 'started') _isOtpVerified = true; }); _connectStringeeFromRide(); } } } catch (e) {} finally { if (mounted) setState(() => _loading = false); } }
+
+  Future<void> _fetchPendingWithRangeCheck() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      String vType = prefs.getString('vehicle_type')?? '';
+      double savedRange = prefs.getDouble('driver_range')?? 20.0;
+      if (mounted) setState(() => _myRange = savedRange);
+      var pos = await LocationHelper.getCurrentLocation();
+      String url = '${AppConstants.baseUrl}/rides/pending/list?driver_id=${widget.driverId}';
+      if (vType.isNotEmpty) url += '&vehicle_type=$vType';
+      if (pos!= null) url += '&driver_lat=${pos.latitude}&driver_lng=${pos.longitude}';
+      final res = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 30));
+      if (res.statusCode == 200) {
+        var list = json.decode(res.body) as List;
+        List filtered = [];
+        for (var r in list) {
+          double dist = double.tryParse(r['distance_from_driver']?.toString()?? "0")?? 0;
+          if (dist <= _myRange) {
+            filtered.add(r);
+            int rideId = int.tryParse(r['id'].toString())?? 0;
+            if (!_alreadyNotifiedIds.contains(rideId)) {
+              _alreadyNotifiedIds.add(rideId);
+              int booked = int.tryParse(r['seats_booked']?.toString()?? "1")?? 1;
+              int total = int.tryParse(r['total_seats']?.toString()?? r['max_pool_seats']?.toString()?? "3")?? 3;
+              await NotificationService.showAlert(rideVehicleType: r['vehicle_type']?.toString(), rideCategory: r['trip_type']?.toString(), currency: r['currency']?.toString(), seatsBooked: booked, totalSeats: total);
+            }
+          }
+        }
+        if (mounted) setState(() { _pending = filtered; _loading = false; });
+      }
+    } catch (e) {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _acceptRide(Map ride) async {
+    try {
+      await _notif.cancel(ride['id']);
+      if (mounted) setState(() { _pending.removeWhere((r) => r['id'] == ride['id']); });
+      final res = await http.put(Uri.parse('${AppConstants.baseUrl}/rides/${ride['id']}/accept?driver_id=${widget.driverId}')).timeout(const Duration(seconds: 30));
+      if (res.statusCode == 200) {
+        final data = json.decode(res.body);
+        String? token = data['driver_token']?.toString()?? data['stringee_token']?.toString()?? data['ride']?['driver_stringee_token']?.toString();
+        if (token!= null && token.isNotEmpty && token!= "null") {
+          await StringeeService.connectWithToken(token);
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('stringee_token', token);
+        }
+        if (mounted) setState(() { _activeRide = data['ride']; _isOtpVerified = false; _otpController.clear(); });
+      } else { _fetchPendingWithRangeCheck(); if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Already Taken'))); }
+    } catch (e) { _fetchPendingWithRangeCheck(); if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'))); }
+  }
+
+  Future<void> _verifyOtp() async { if (_otpController.text.trim().length!= 6) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter 6 digit OTP'))); return; } setState(() => _isVerifying = true); try { final res = await http.post(Uri.parse('${AppConstants.baseUrl}/rides/${_activeRide!['id']}/verify-otp'), headers: {'Content-Type': 'application/json'}, body: json.encode({"otp": _otpController.text.trim()})).timeout(const Duration(seconds: 30)); if (res.statusCode == 200) { if (mounted) setState(() => _isOtpVerified = true); } else { if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('❌ Wrong OTP'))); } } catch (e) {} finally { if (mounted) setState(() => _isVerifying = false); } }
+  Future<bool> checkMicPermission() async { var status = await Permission.microphone.status; if (!status.isGranted) { status = await Permission.microphone.request(); } return status.isGranted; }
+  Future<void> _callUser() async { if (_activeRide == null) return; bool hasMic = await checkMicPermission(); if (!hasMic) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Mic permission दो, तभी कॉल लगेगी'))); return; } String riderId = _activeRide!['stringee_user_id']?.toString()?? ""; if (riderId.isEmpty) { riderId = _activeRide!['user_id'].toString(); } if (!StringeeService.isConnected) { final prefs = await SharedPreferences.getInstance(); String? token = prefs.getString('stringee_token')?? _activeRide!['driver_stringee_token']?.toString(); if (token!= null) await StringeeService.connectWithToken(token); } StringeeService.makeCall(riderId); if (mounted) setState(() => _callStatus = "📞 Calling $riderId..."); }
+  void _hangup() { StringeeService.hangup(); if (mounted) setState(() => _callStatus = "Call Ended"); }
+  Future<void> _completeRide() async { if (_activeRide == null) return; if (!_isOtpVerified) { ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Verify OTP first!'))); return; } await http.put(Uri.parse('${AppConstants.baseUrl}/rides/${_activeRide!['id']}/complete')); await StringeeService.disconnect(); if (mounted) setState(() { _activeRide = null; _callStatus = "Idle"; _isOtpVerified = false; _otpController.clear(); }); _fetchPendingWithRangeCheck(); }
+  @override void dispose() { _locationStream?.cancel(); _wsChannel?.sink.close(); _otpController.dispose(); super.dispose(); }
+
+  Widget _buildPendingList() {
+  if (_loading) return const Center(child: CircularProgressIndicator());
+  if (_pending.isEmpty) { return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [const Icon(Icons.search_off, size: 60, color: Colors.grey), const SizedBox(height: 10), const Text('No Rides Nearby', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)), const SizedBox(height: 5), Text('Searching in ${_myRange.toInt()} km range', style: const TextStyle(color: Colors.grey, fontSize: 13))])); }
+  return ListView.builder(padding: const EdgeInsets.all(8), itemCount: _pending.length, itemBuilder: (ctx, i) {
+    final r = _pending[i];
+    double dist = double.tryParse(r['distance_from_driver']?.toString()?? "0")?? 0;
+    String tripType = (r['trip_type']?.toString()?? 'ride').toLowerCase();
+    bool isParcel = tripType.contains('parcel');
+    bool isPool = tripType.contains('pool');
+    String curr = r['currency']?.toString()?? '₹';
+    Color badgeColor = isPool? Colors.blue : isParcel? Colors.orange : Colors.green;
+    String label = isPool? "👥 POOL" : isParcel? "📦 PARCEL" : "🚗 RIDE";
+    String pickupAddr = r['pickup_address']?.toString()?? 'Pickup';
+    String dropAddr = r['drop_address']?.toString()?? 'Drop';
+    int seatsBooked = int.tryParse(r['seats_booked']?.toString()?? "1")?? 1;
+    int totalSeats = int.tryParse(r['total_seats']?.toString()?? r['max_pool_seats']?.toString()?? "3")?? 3;
+    if(!isPool) totalSeats = 1;
+    return Card(margin: const EdgeInsets.only(bottom: 12), elevation: 3, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)), child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Container(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3), decoration: BoxDecoration(color: badgeColor, borderRadius: BorderRadius.circular(5)), child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
+        const SizedBox(width: 6),
+        Container(padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3), decoration: BoxDecoration(color: Colors.grey.shade200, borderRadius: BorderRadius.circular(5)), child: Text("$curr${r['fare']} | ${dist.toStringAsFixed(1)}km", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold))),
+        if(isPool)...[
+          const SizedBox(width: 6),
+          Container(padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3), decoration: BoxDecoration(color: Colors.blue.shade50, border: Border.all(color: Colors.blue), borderRadius: BorderRadius.circular(5)), child: Text(r['pool_group_id']?? '', style: const TextStyle(fontSize: 10, color: Colors.blue, fontWeight: FontWeight.bold))),
+        ]
+      ]),
+      if(isPool)...[
+        const SizedBox(height: 8),
+        Container(
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(color: Colors.blue.shade50, borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.blue.shade200)),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4), decoration: BoxDecoration(color: Colors.blue, borderRadius: BorderRadius.circular(5)), child: Row(children: [Icon(Icons.event_seat, size: 14, color: Colors.white), SizedBox(width: 3), Text("Total: $totalSeats", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))])),
+              SizedBox(width: 6),
+              Container(padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4), decoration: BoxDecoration(color: Colors.green, borderRadius: BorderRadius.circular(5)), child: Text("Booked: $seatsBooked", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
+              SizedBox(width: 6),
+              Container(padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4), decoration: BoxDecoration(color: Colors.orange, borderRadius: BorderRadius.circular(5)), child: Text("Left: ${totalSeats - seatsBooked}", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold))),
+            ],
+          ),
+        ),
+      ],
+      const SizedBox(height: 10),
+      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Icon(Icons.my_location, color: Colors.green, size: 18),
+        const SizedBox(width: 6),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text("PICKUP:", style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.grey)),
+          Text(pickupAddr, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+        ])),
+      ]),
+      const SizedBox(height: 8),
+      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Icon(Icons.location_on, color: Colors.red, size: 18),
+        const SizedBox(width: 6),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text("DROP:", style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.grey)),
+          Text(dropAddr, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+        ])),
+      ]),
+      const SizedBox(height: 12),
+      Row(children: [
+        Expanded(child: OutlinedButton.icon(onPressed: () { Navigator.push(context, MaterialPageRoute(builder: (_) => RideMapView(ride: r))); }, icon: const Icon(Icons.map, size: 16), label: const Text("Map देखें", style: TextStyle(fontSize: 12)), style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 8)))),
+        const SizedBox(width: 10),
+        Expanded(child: ElevatedButton(onPressed: () => _acceptRide(r), style: ElevatedButton.styleFrom(backgroundColor: badgeColor, padding: const EdgeInsets.symmetric(vertical: 8)), child: const Text('Accept', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold)))),
+      ])
+    ]))));
+  });
+  }
+
+  @override Widget build(BuildContext context) {
+    return Scaffold(appBar: AppBar(title: Text('${widget.driverName} - ${_myRange.toInt()}km'), backgroundColor: Colors.green, actions: [IconButton(icon: const Icon(Icons.logout), onPressed: () async { final p = await SharedPreferences.getInstance(); await p.clear(); await StringeeService.disconnect(); if (!mounted) return; Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const LoginScreen())); })]), body: _activeRide == null? Column(children: [Container(width: double.infinity, padding: const EdgeInsets.all(10), color: Colors.green.shade50, child: Row(children: [const Icon(Icons.circle, color: Colors.green, size: 12), const SizedBox(width: 6), Text('Online - ${_pending.length} Rides in ${_myRange.toInt()}km | $_callStatus', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)), const Spacer(), IconButton(icon: const Icon(Icons.refresh, size: 20), onPressed: _fetchPendingWithRangeCheck)])), Expanded(child: Container(margin: const EdgeInsets.all(10), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.grey.shade300)), child: _buildPendingList()))]) : _ActiveRideWithMap(ride: _activeRide!, driverId: widget.driverId, isOtpVerified: _isOtpVerified, otpController: _otpController, onVerifyOtp: _verifyOtp, onComplete: _completeRide, onCall: _callUser, onHangup: _hangup, callStatus: _callStatus));
+  }
+}
+
+class RideMapView extends StatefulWidget {
+  final Map ride; const RideMapView({super.key, required this.ride});
+  @override State<RideMapView> createState() => _RideMapViewState();
+}
+
+class _RideMapViewState extends State<RideMapView> {
+  GoogleMapController? mapController; LatLng? driverLatLng, pickupLatLng, dropLatLng; Set<Marker> markers = {}; Set<Polyline> polylines = {}; String distanceText = "Route Loading..."; bool loading = true;
+
+  @override void initState() { super.initState(); _initMap(); }
+
+  Future<void> _initMap() async {
+    double pLat = double.tryParse(widget.ride['pickup_lat']?.toString()?? widget.ride['pickup_latitude']?.toString()?? "0")?? 0;
+    double pLng = double.tryParse(widget.ride['pickup_lng']?.toString()?? widget.ride['pickup_longitude']?.toString()?? widget.ride['pickup_lng']?.toString()?? "0")?? 0;
+    double dLat = double.tryParse(widget.ride['drop_lat']?.toString()?? widget.ride['drop_latitude']?.toString()?? "0")?? 0;
+    double dLng = double.tryParse(widget.ride['drop_lng']?.toString()?? widget.ride['drop_longitude']?.toString()?? "0")?? 0;
+
+    pickupLatLng = LatLng(pLat, pLng);
+    dropLatLng = LatLng(dLat, dLng);
+
+    var pos = await LocationHelper.getCurrentLocation();
+    if (pos!= null) driverLatLng = LatLng(pos.latitude, pos.longitude);
+
+    setState(() {
+      markers.add(Marker(markerId: const MarkerId('pickup'), position: pickupLatLng!, icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed), infoWindow: InfoWindow(title: "Pickup")));
+      markers.add(Marker(markerId: const MarkerId('drop'), position: dropLatLng!, icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen), infoWindow: InfoWindow(title: "Drop")));
+      if (driverLatLng!= null) {
+        markers.add(Marker(markerId: const MarkerId('driver'), position: driverLatLng!, icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue), infoWindow: const InfoWindow(title: "You")));
+      }
+      loading = false;
+    });
+
+    await _getRoadSecure();
+  }
+
+  Future<void> _getRoadSecure() async {
+    if (pickupLatLng == null || dropLatLng == null) return;
+    polylines.clear();
+    try {
+      if (driverLatLng!= null) {
+        var route1 = await ApiService.getRouteFromBackend(origin: driverLatLng!, dest: pickupLatLng!);
+        if (route1!= null && route1['points']!= null && route1['points'].toString().isNotEmpty) {
+          var decoded1 = PolylinePoints().decodePolyline(route1['points']);
+          var pts1 = decoded1.map((e) => LatLng(e.latitude, e.longitude)).toList();
+          if (pts1.isNotEmpty) {
+            polylines.add(Polyline(polylineId: const PolylineId('driver_to_pickup'), points: pts1, color: Colors.blue, width: 6, jointType: JointType.round));
+          }
+        } else {
+          polylines.add(Polyline(polylineId: const PolylineId('driver_to_pickup_direct'), points: [driverLatLng!, pickupLatLng!], color: Colors.blue, width: 4, patterns: [PatternItem.dot, PatternItem.gap(10)]));
+        }
+      }
+      var route2 = await ApiService.getRouteFromBackend(origin: pickupLatLng!, dest: dropLatLng!);
+      if (route2!= null && route2['points']!= null && route2['points'].toString().isNotEmpty) {
+        var decoded2 = PolylinePoints().decodePolyline(route2['points']);
+        var pts2 = decoded2.map((e) => LatLng(e.latitude, e.longitude)).toList();
+        if (pts2.isNotEmpty) {
+          polylines.add(Polyline(polylineId: const PolylineId('pickup_to_drop'), points: pts2, color: Colors.black, width: 6, jointType: JointType.round));
+          distanceText = "${route2['distance_text']?? ''} ${route2['duration_text']?? ''}";
+        }
+      } else {
+        polylines.add(Polyline(polylineId: const PolylineId('pickup_to_drop_direct'), points: [pickupLatLng!, dropLatLng!], color: Colors.black, width: 6));
+        distanceText = "Direct Route";
+      }
+      if (mounted) setState(() {});
+    } catch (e) {
+      print("Polyline Error $e");
+    }
+  }
+
+  @override Widget build(BuildContext context) {
+    String pickupAddr = widget.ride['pickup_address']?.toString()?? 'Pickup Address nahi mila';
+    String dropAddr = widget.ride['drop_address']?.toString()?? 'Drop Address nahi mila';
+    int seatsBooked = int.tryParse(widget.ride['seats_booked']?.toString()?? "1")?? 1;
+    int totalSeats = int.tryParse(widget.ride['total_seats']?.toString()?? widget.ride['max_pool_seats']?.toString()?? "3")?? 3;
+    bool isPool = widget.ride['trip_type']?.toString().toLowerCase().contains('pool')?? false;
+    return Scaffold(
+      appBar: AppBar(title: Text(distanceText + (isPool? " | Seats: $seatsBooked/$totalSeats" : ""), style: const TextStyle(fontSize: 12)), backgroundColor: Colors.green),
+      body: loading? const Center(child: CircularProgressIndicator()) : Stack(children: [
+        GoogleMap(initialCameraPosition: CameraPosition(target: pickupLatLng!, zoom: 12), markers: markers, polylines: polylines, myLocationEnabled: true, onMapCreated: (c) => mapController = c),
+        Positioned(top: 10, left: 10, child: Container(padding: const EdgeInsets.all(8), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)]), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [Container(width: 20, height: 4, color: Colors.blue), const SizedBox(width: 6), const Text("Driver से Pickup", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))]), const SizedBox(height: 4), Row(children: [Container(width: 20, height: 4, color: Colors.black), const SizedBox(width: 6), const Text("Pickup से Drop", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold))])]))),
+        Positioned(bottom: 20, left: 15, right: 15, child: Container(padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8)]), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Row(children: [const Icon(Icons.my_location, color: Colors.red, size: 18), const SizedBox(width: 6), Expanded(child: Text(pickupAddr, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)))]), const Divider(), Row(children: [const Icon(Icons.location_on, color: Colors.green, size: 18), const SizedBox(width: 6), Expanded(child: Text(dropAddr, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)))]), if(isPool) Padding(padding: EdgeInsets.only(top: 8), child: Text("💺 Total Seats (Ride Table): $totalSeats | Booked: $seatsBooked | Left: ${totalSeats - seatsBooked}", style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.blue))),]))),
+      ]),
+    );
+  }
+}
+
+class _ActiveRideWithMap extends StatefulWidget {
+  final Map ride; final String driverId; final bool isOtpVerified; final TextEditingController otpController; final VoidCallback onVerifyOtp, onComplete, onCall, onHangup; final String callStatus;
+  const _ActiveRideWithMap({required this.ride, required this.driverId, required this.isOtpVerified, required this.otpController, required this.onVerifyOtp, required this.onComplete, required this.onCall, required this.onHangup, required this.callStatus});
+  @override State<_ActiveRideWithMap> createState() => _ActiveRideWithMapState();
+}
+
+class _ActiveRideWithMapState extends State<_ActiveRideWithMap> {
+  GoogleMapController? mapController; LatLng? driverLatLng, pickupLatLng, dropLatLng; Set<Marker> markers = {}; Set<Polyline> polylines = {}; String driverToUserText = ""; String pickupToDropText = ""; StreamSubscription<Position>? _posStream; Timer? _timer; bool _isSecondRouteFetched = false;
+  List _alongRouteRides = [];
+  Timer? _alongTimer;
+
+  @override void initState() {
+    super.initState();
+    _initMap();
+    if(widget.ride['trip_type']?.toString().toLowerCase().contains('pool')?? false){
+      _fetchAlongRouteRides();
+      _alongTimer = Timer.periodic(Duration(seconds: 20), (_) => _fetchAlongRouteRides());
+    }
+  }
+  @override void dispose() { _posStream?.cancel(); _timer?.cancel(); _alongTimer?.cancel(); super.dispose(); }
+
+  Future<void> _fetchAlongRouteRides() async {
+    try{
+      var pos = await LocationHelper.getCurrentLocation();
+      String url = '${AppConstants.baseUrl}/rides/pool/along-route/${widget.ride['id']}?driver_id=${widget.driverId}';
+      if(pos!= null) url += '&driver_lat=${pos.latitude}&driver_lng=${pos.longitude}';
+      final res = await http.get(Uri.parse(url)).timeout(Duration(seconds: 10));
+      if(res.statusCode == 200){
+        var list = json.decode(res.body) as List;
+        if(mounted) setState(()=> _alongRouteRides = list);
+      }
+    }catch(e){}
+  }
+
+  Future<void> _initMap() async {
+    pickupLatLng = LatLng(double.tryParse(widget.ride['pickup_lat'].toString())?? 0, double.tryParse(widget.ride['pickup_lng'].toString())?? 0);
+    dropLatLng = LatLng(double.tryParse(widget.ride['drop_lat'].toString())?? 0, double.tryParse(widget.ride['drop_lng'].toString())?? 0);
+    Position? pos = await LocationHelper.getCurrentLocation(); if (pos!= null) driverLatLng = LatLng(pos.latitude, pos.longitude);
+    _updateMarkers(); _getBothRoadsSecure();
+    _posStream = Geolocator.getPositionStream(locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, distanceFilter: 15)).listen((p) { driverLatLng = LatLng(p.latitude, p.longitude); _updateMarkers(); if (mounted) setState(() {}); ApiService.updateDriverLocation(driverId: widget.driverId, lat: p.latitude, lng: p.longitude); });
+    _timer = Timer.periodic(const Duration(seconds: 45), (_) => _getBothRoadsSecure());
+  }
+  void _updateMarkers() {
+    if (driverLatLng == null || pickupLatLng == null || dropLatLng == null) return;
+    markers = {
+      Marker(markerId: const MarkerId('driver'), position: driverLatLng!, icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueBlue)),
+      Marker(markerId: const MarkerId('pickup'), position: pickupLatLng!, icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed)),
+      Marker(markerId: const MarkerId('drop'), position: dropLatLng!, icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueGreen))
+    };
+  }
+  Future<void> _getBothRoadsSecure() async {
+    if (driverLatLng == null || pickupLatLng == null || dropLatLng == null) return;
+    try {
+      var route1 = await ApiService.getRouteFromBackend(origin: driverLatLng!, dest: pickupLatLng!);
+      List<LatLng> pts1 = []; String d1 = driverToUserText;
+      if (route1!= null && route1['points']!= null) {
+        d1 = "${route1['distance_text']?? ''} ${route1['duration_text']?? ''}";
+        var decoded1 = PolylinePoints().decodePolyline(route1['points']);
+        pts1 = decoded1.map((e) => LatLng(e.latitude, e.longitude)).toList();
+      }
+      List<LatLng> pts2 = []; String d2 = pickupToDropText;
+      if (!_isSecondRouteFetched) {
+        var route2 = await ApiService.getRouteFromBackend(origin: pickupLatLng!, dest: dropLatLng!);
+        if (route2!= null && route2['points']!= null) {
+          d2 = "${route2['distance_text']?? ''} ${route2['duration_text']?? ''}";
+          var decoded2 = PolylinePoints().decodePolyline(route2['points']);
+          pts2 = decoded2.map((e) => LatLng(e.latitude, e.longitude)).toList();
+          _isSecondRouteFetched = true;
+        }
+      }
+      if (mounted) {
+        setState(() {
+          driverToUserText = d1; pickupToDropText = d2;
+          polylines.clear();
+          if (pts1.isNotEmpty) polylines.add(Polyline(polylineId: const PolylineId('driver_to_user'), points: pts1, color: Colors.blue, width: 6, geodesic: true));
+          if (pts2.isNotEmpty) polylines.add(Polyline(polylineId: const PolylineId('pickup_to_drop'), points: pts2, color: Colors.black, width: 6, geodesic: true));
+          if (pts1.isEmpty && driverLatLng!= null) polylines.add(Polyline(polylineId: const PolylineId('driver_to_user_direct'), points: [driverLatLng!, pickupLatLng!], color: Colors.blue, width: 4, patterns: [PatternItem.dot, PatternItem.gap(10)]));
+          if (pts2.isEmpty) polylines.add(Polyline(polylineId: const PolylineId('pickup_to_drop_direct'), points: [pickupLatLng!, dropLatLng!], color: Colors.black, width: 4));
+        });
+      }
+    } catch (e) {}
+  }
+  @override Widget build(BuildContext context) {
+    bool isParcel = widget.ride['trip_type']?.toString().toLowerCase().contains('parcel')?? false;
+    bool isPool = widget.ride['trip_type']?.toString().toLowerCase().contains('pool')?? false;
+    String curr = widget.ride['currency']?.toString()?? '₹';
+    String tripLabel = isPool? "👥 POOL" : isParcel? "📦 PARCEL" : "🚗 RIDE";
+    int seatsBooked = int.tryParse(widget.ride['seats_booked']?.toString()?? "1")?? 1;
+    int totalSeats = int.tryParse(widget.ride['total_seats']?.toString()?? widget.ride['max_pool_seats']?.toString()?? "3")?? 3;
+    return Column(children: [Expanded(flex: 5, child: Stack(children: [GoogleMap(initialCameraPosition: CameraPosition(target: driverLatLng?? pickupLatLng!, zoom: 15), markers: markers, polylines: polylines, myLocationEnabled: true, onMapCreated: (c) => mapController = c), Positioned(top: 10, left: 10, right: 10, child: (driverToUserText.isEmpty && pickupToDropText.isEmpty)? const SizedBox.shrink() : Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: Colors.black87, borderRadius: BorderRadius.circular(10)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [if (driverToUserText.isNotEmpty) Text('🔵 Driver से Pickup: $driverToUserText', style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)), if (pickupToDropText.isNotEmpty) Text('⚫ Pickup से Drop: $pickupToDropText', style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold))])))] )), Expanded(flex: 5, child: Container(padding: const EdgeInsets.all(12), color: Colors.white, child: SingleChildScrollView(child: Column(children: [Container(padding: const EdgeInsets.all(10), decoration: BoxDecoration(color: isPool? Colors.blue.shade50 : isParcel? Colors.orange.shade50 : Colors.green.shade50, borderRadius: BorderRadius.circular(10)), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [Text('$tripLabel #${widget.ride['id']} - $curr${widget.ride['fare']} ${isPool? " | Group: ${widget.ride['pool_group_id']}" : ""} | Seats: $seatsBooked/$totalSeats', style: const TextStyle(fontWeight: FontWeight.bold)), Text('📍 ${widget.ride['pickup_address']}'), Text('🏁 ${widget.ride['drop_address']}')])),
+      const SizedBox(height: 10),
+      if(isPool && _alongRouteRides.isNotEmpty)
+        Container(
+          margin: EdgeInsets.only(bottom: 10),
+          padding: EdgeInsets.all(10),
+          decoration: BoxDecoration(color: Colors.blue.shade50, borderRadius: BorderRadius.circular(10), border: Border.all(color: Colors.blue)),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [Icon(Icons.route, color: Colors.blue, size: 18), SizedBox(width: 6), Text("रास्ते में ${_alongRouteRides.length} Pool Rides!", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blue, fontSize: 13))]),
+            SizedBox(height: 8),
+          ..._alongRouteRides.map((r) => Card(margin: EdgeInsets.only(bottom: 6), child: ListTile(
+              dense: true,
+              title: Text("${r['pickup_address']}", maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text("Drop: ${r['drop_address']}", maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: 10)),
+                Text("${r['distance_from_driver']}km आगे | ₹${r['fare']} | Seats:${r['seats_booked']}/${r['total_seats']}", style: TextStyle(fontSize: 11, color: Colors.grey[700])),
+              ]),
+              trailing: ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.blue, minimumSize: Size(55, 28), padding: EdgeInsets.symmetric(horizontal: 8)),
+                onPressed: () async {
+                  final res = await http.put(Uri.parse('${AppConstants.baseUrl}/rides/${r['id']}/accept-pool?driver_id=${widget.driverId}&group_id=${widget.ride['pool_group_id']}')).timeout(Duration(seconds: 10));
+                  if(res.statusCode == 200){ ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Pool Ride Added! ${r['pickup_address']}"))); _fetchAlongRouteRides(); }
+                },
+                child: Text("Pick", style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+              ),
+            ))).toList()
+          ]),
+        ),
+      Row(children: [Expanded(child: ElevatedButton.icon(onPressed: widget.onCall, icon: const Icon(Icons.call), label: const Text('Call'), style: ElevatedButton.styleFrom(backgroundColor: Colors.green))), const SizedBox(width: 8), Expanded(child: ElevatedButton.icon(onPressed: widget.onHangup, icon: const Icon(Icons.call_end), label: const Text('Cut'), style: ElevatedButton.styleFrom(backgroundColor: Colors.red)))]), Text(widget.callStatus, style: const TextStyle(fontWeight: FontWeight.bold)), const SizedBox(height: 8), if (!widget.isOtpVerified)...[TextField(controller: widget.otpController, keyboardType: TextInputType.number, maxLength: 6, decoration: const InputDecoration(hintText: 'Enter OTP', border: OutlineInputBorder(), counterText: '')), const SizedBox(height: 6), SizedBox(width: double.infinity, child: ElevatedButton(onPressed: widget.onVerifyOtp, style: ElevatedButton.styleFrom(backgroundColor: Colors.orange), child: const Text('Verify OTP', style: TextStyle(color: Colors.white))))] else...[SizedBox(width: double.infinity, child: ElevatedButton.icon(onPressed: widget.onComplete, icon: const Icon(Icons.check), label: Text('Complete $tripLabel'), style: ElevatedButton.styleFrom(backgroundColor: Colors.blue)))]])) ))]);
+  }
+}
 
