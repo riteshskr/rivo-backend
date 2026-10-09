@@ -793,3 +793,63 @@ def get_archived():
         return res.data
     except Exception as e:
         return {"error": str(e)}
+@app.get("/rides/{ride_id}/driver-location")
+def get_driver_location_for_ride(ride_id: int):
+    try:
+        ride_res = supabase.table("rides").select("driver_id").eq("id", ride_id).execute()
+        if not ride_res.data:
+            raise HTTPException(404, "Ride not found")
+        driver_id = ride_res.data[0].get("driver_id")
+        if not driver_id:
+            return {"lat": None, "lng": None, "current_latitude": None, "current_longitude": None}
+        
+        d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen").eq("id", driver_id).execute()
+        if not d_res.data:
+            d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen").eq("driver_id", driver_id).execute()
+        if not d_res.data:
+            raise HTTPException(404, "Driver not found")
+        
+        d = d_res.data[0]
+        lat = d.get("current_latitude")
+        lng = d.get("current_longitude")
+        return {
+            "driver_id": driver_id,
+            "lat": lat,
+            "lng": lng,
+            "current_latitude": lat,
+            "current_longitude": lng,
+            "latitude": lat,
+            "longitude": lng,
+            "last_seen": d.get("last_seen")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"driver-location error {e}")
+        raise HTTPException(500, str(e))
+
+# Also enrich /rides/{ride_id} to include driver live location
+@app.get("/rides/{ride_id}/with-driver-location")
+def get_ride_with_driver_location(ride_id: int):
+    res = supabase.table("rides").select("*").eq("id", ride_id).execute()
+    if not res.data:
+        raise HTTPException(404, "Ride not found")
+    ride = res.data[0]
+    driver_id = ride.get("driver_id")
+    if driver_id:
+        try:
+            d_res = supabase.table("drivers").select("current_latitude,current_longitude,current_lat,current_lng").eq("id", driver_id).execute()
+            if not d_res.data:
+                d_res = supabase.table("drivers").select("current_latitude,current_longitude").eq("driver_id", driver_id).execute()
+            if d_res.data:
+                d = d_res.data[0]
+                ride["driver_current_latitude"] = d.get("current_latitude")
+                ride["driver_current_longitude"] = d.get("current_longitude")
+                ride["current_latitude"] = d.get("current_latitude")
+                ride["current_longitude"] = d.get("current_longitude")
+                ride["driver_lat"] = d.get("current_latitude")
+                ride["driver_lng"] = d.get("current_longitude")
+        except:
+            pass
+    return ride
+
