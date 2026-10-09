@@ -366,7 +366,7 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
         "status": "completed",
         "passenger_status": "dropped",
         "completed_at": datetime.now(timezone.utc).isoformat(),
-        "dropped_at": datetime.now(timezone.utc).isoformat()
+        
     }).eq("id", ride_id).execute()
 
     # Bachi hui seats gin lo
