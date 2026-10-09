@@ -361,34 +361,39 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
     ride = res.data[0]
     gid = group_id or ride.get("pool_group_id")
 
-    # YAHI SE RIDE COMPLETED HOTI HAI
     supabase.table("rides").update({
         "status": "completed",
         "passenger_status": "dropped",
         "completed_at": datetime.now(timezone.utc).isoformat(),
-        
     }).eq("id", ride_id).execute()
 
-   if background_tasks:
+    if background_tasks is not None:
         background_tasks.add_task(archive_and_delete_ride, ride_id)
     else:
-        # fallback agar background task na ho
         try:
             archive_and_delete_ride(ride_id)
-        except:
+        except Exception:
             pass
 
-    # 3. Bachi hui seats
     booked = 0
     total = 4
     if gid:
-        remaining_res = supabase.table("rides").select("seats_booked,total_seats,max_pool_seats").eq("pool_group_id", gid).in_("status", ["accepted","started"]).execute()
+        remaining_res = supabase.table("rides").select("seats_booked,total_seats,max_pool_seats").eq("pool_group_id", gid).in_("status", ["accepted", "started"]).execute()
         remaining_data = remaining_res.data or []
         booked = sum([int(r.get("seats_booked") or 1) for r in remaining_data])
         if remaining_data:
             total = int(remaining_data[0].get("total_seats") or remaining_data[0].get("max_pool_seats") or 4)
 
-    return {"success": True,"ride_id": ride_id,"status": "completed","booked_seats": booked,"total_seats": total,"left_seats": total - booked}
+    return {
+        "success": True,
+        "ride_id": ride_id,
+        "status": "completed",
+        "booked_seats": booked,
+        "total_seats": total,
+        "left_seats": total - booked
+    }
+
+
 
 
 
