@@ -360,7 +360,16 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
         raise HTTPException(404, "Ride नहीं मिली")
     ride = res.data[0]
     gid = group_id or ride.get("pool_group_id")
-    supabase.table("rides").update({"status": "completed","passenger_status": "dropped","completed_at": datetime.now(timezone.utc).isoformat(),"dropped_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id).execute()
+
+    # YAHI SE RIDE COMPLETED HOTI HAI
+    supabase.table("rides").update({
+        "status": "completed",
+        "passenger_status": "dropped",
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "dropped_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", ride_id).execute()
+
+    # Bachi hui seats gin lo
     booked = 0
     total = 4
     if gid:
@@ -369,10 +378,10 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
         booked = sum([int(r.get("seats_booked") or 1) for r in remaining_data])
         if remaining_data:
             total = int(remaining_data[0].get("total_seats") or remaining_data[0].get("max_pool_seats") or 4)
-        else:
-            total = int(ride.get("total_seats") or ride.get("max_pool_seats") or 4)
-            booked = 0
-    return {"success": True,"ride_id": ride_id,"status": "completed","booked_seats": booked,"total_seats": total,"left_seats": total - booked,"message": f"Ride {ride_id} Dropped! {total - booked} seats left"}
+
+    return {"success": True,"ride_id": ride_id,"status": "completed","booked_seats": booked,"total_seats": total,"left_seats": total - booked}
+
+
 
 @app.get("/rides/pool/group/{group_id}/driver/{driver_id}")
 def get_my_pooled_rides(group_id: str, driver_id: str):
@@ -648,14 +657,28 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
 
 @app.put("/rides/{ride_id}/accept-pool")
 def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id: str = Query(...)):
+    # 1. Driver का पूरा data निकालो
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id",driver_id).execute()
+    if not d_res.data:
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id",driver_id).execute()
+    if not d_res.data:
+        raise HTTPException(404, "Driver not found")
+    driver = d_res.data[0]
+
+    # 2. Seats check
     group_rides = supabase.table("rides").select("seats_booked,total_seats,max_pool_seats").eq("pool_group_id", group_id).in_("status",["accepted","started"]).execute().data or []
     booked = sum([int(r.get("seats_booked") or 1) for r in group_rides])
-    max_seats = 4
-    if group_rides:
-        max_seats = int(group_rides[0].get("total_seats") or group_rides[0].get("max_pool_seats") or 4)
-    driver_token, driver_clean_id = generate_stringee_token(driver_id, str(ride_id))
+    max_seats = int(group_rides[0].get("total_seats") or group_rides[0].get("max_pool_seats") or 4) if group_rides else 4
+
+    driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
+
+    # 3. YAHI MAIN FIX - Driver details ke sath update
     res = supabase.table("rides").update({
-        "driver_id": driver_id,
+        "driver_id": driver["id"],
+        "driver_name": driver.get("name"),
+        "driver_phone": driver.get("phone"),
+        "vehicle_number": driver.get("vehicle_number"),
+        "vehicle_type": driver.get("vehicle_type"),
         "pool_group_id": group_id,
         "status": "accepted",
         "passenger_status": "waiting",
@@ -663,9 +686,13 @@ def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id:
         "driver_stringee_token": driver_token,
         "driver_stringee_user_id": driver_clean_id
     }).eq("id", ride_id).eq("status","pending").execute()
+
     if not res.data:
         raise HTTPException(409, "Already taken or seat full")
-    return {"success": True, "booked": booked + int(res.data[0].get("seats_booked") or 1), "total": max_seats}
+
+    return {"success": True, "ride": res.data[0], "booked": booked + int(res.data[0].get("seats_booked") or 1), "total": max_seats}
+
+
 
 @app.get("/rides/pool/along-route/{active_ride_id}")
 def get_pool_rides_along_route(active_ride_id: int, driver_id: str = Query(...), driver_lat: float = Query(None), driver_lng: float = Query(None), farthest_drop_lat: float = Query(None), farthest_drop_lng: float = Query(None)):
@@ -829,6 +856,34 @@ def get_driver_location_for_ride(ride_id: int):
         raise HTTPException(500, str(e))
 
 # Also enrich /rides/{ride_id} to include driver live location
+
+@app.put("/rides/pool/group/{group_id}/complete")
+def complete_pool_group(group_id: str, driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
+    try:
+        # उस group की सारी active rides निकालो
+        res = supabase.table("rides").select("id").eq("pool_group_id", group_id).in_("status", ["accepted","started","arrived","pending"]).execute()
+        rides = res.data or []
+
+        if not rides:
+            return {"success": True, "message": "Already completed"}
+
+        # सभी को completed करो
+        for r in rides:
+            supabase.table("rides").update({
+                "status": "completed",
+                "passenger_status": "dropped",
+                "completed_at": datetime.now(timezone.utc).isoformat()
+            }).eq("id", r["id"]).execute()
+            # चाहो तो archive भी कर सकते हो
+            if background_tasks:
+                background_tasks.add_task(archive_and_delete_ride, r["id"])
+
+        return {"success": True, "completed_count": len(rides), "group_id": group_id}
+    except Exception as e:
+        print(f"Group Complete Error {e}")
+        raise HTTPException(500, str(e))
+
+
 @app.get("/rides/{ride_id}/with-driver-location")
 def get_ride_with_driver_location(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
