@@ -385,18 +385,21 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
 
 @app.get("/rides/pool/group/{group_id}/driver/{driver_id}")
 def get_my_pooled_rides(group_id: str, driver_id: str):
-    res = supabase.table("rides").select("*").eq("pool_group_id", group_id).eq("driver_id", driver_id).order("id", desc=False).execute()
+    # सिर्फ Active rides लाओ, Completed को बिलकुल मत लाओ
+    res = supabase.table("rides").select("*").eq("pool_group_id", group_id).eq("driver_id", driver_id).in_("status", ["accepted","started","arrived","pending"]).order("id", desc=False).execute()
     rides = res.data or []
-    active = [r for r in rides if r.get("status") in ["accepted","started"]]
+    active = rides # अब rides ही active है
+
     booked = sum([int(r.get("seats_booked") or 1) for r in active])
     total = 4
-    if rides:
-        total = int(rides[0].get("total_seats") or rides[0].get("max_pool_seats") or 4)
+    if active:
+        total = int(active[0].get("total_seats") or active[0].get("max_pool_seats") or 4)
+
     farthest = None
     max_dist = 0
-    if rides:
-        first_pickup_lat = float(rides[0].get("pickup_lat",0))
-        first_pickup_lng = float(rides[0].get("pickup_lng",0))
+    if active:
+        first_pickup_lat = float(active[0].get("pickup_lat",0))
+        first_pickup_lng = float(active[0].get("pickup_lng",0))
         for r in active:
             try:
                 d_lat = float(r.get("drop_lat",0))
@@ -407,21 +410,9 @@ def get_my_pooled_rides(group_id: str, driver_id: str):
                     farthest = {"lat": d_lat, "lng": d_lng, "ride_id": r["id"]}
             except:
                 pass
-    return {"rides": rides,"booked_seats": booked,"total_seats": total,"left_seats": total - booked,"farthest_drop": farthest,"active_count": len(active),"total_count": len(rides)}
 
-@app.put("/rides/{ride_id}/drop-passenger")
-def drop_passenger(ride_id: int, payload: PoolDropRequest, background_tasks: BackgroundTasks):
-    res = supabase.table("rides").select("*").eq("id", ride_id).execute()
-    if not res.data:
-        raise HTTPException(404, "Ride nahi mili")
-    ride = res.data[0]
-    supabase.table("rides").update({"passenger_status": "dropped", "status": "completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", ride_id).execute()
-    background_tasks.add_task(archive_and_delete_ride, ride_id)
-    gid = ride.get("pool_group_id")
-    if gid:
-        remaining = supabase.table("rides").select("id").eq("pool_group_id", gid).neq("status","completed").execute().data or []
-        return {"success": True, "group_completed": len(remaining)==0, "remaining": len(remaining)}
-    return {"success": True, "group_completed": True}
+    # अब rides में सिर्फ active ही जाएगा
+    return {"rides": active,"booked_seats": booked,"total_seats": total,"left_seats": total - booked,"farthest_drop": farthest,"active_count": len(active),"total_count": len(active)}
 
 @app.put("/rides/{ride_id}/cancel")
 def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
