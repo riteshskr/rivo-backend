@@ -369,7 +369,16 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
         
     }).eq("id", ride_id).execute()
 
-    # Bachi hui seats gin lo
+   if background_tasks:
+        background_tasks.add_task(archive_and_delete_ride, ride_id)
+    else:
+        # fallback agar background task na ho
+        try:
+            archive_and_delete_ride(ride_id)
+        except:
+            pass
+
+    # 3. Bachi hui seats
     booked = 0
     total = 4
     if gid:
