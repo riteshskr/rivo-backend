@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 21.0 Double Confirmation 2min")
+app = FastAPI(title="Rivo Taxi API - Final 22.0 With Driver Photo")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -101,6 +101,31 @@ def is_point_along_route(curr_lat, curr_lng, drop_lat, drop_lng, new_lat, new_ln
         return False, 999
     except:
         return False, 999
+
+# ===== DRIVER PHOTO ENRICH FUNCTION - NAYA =====
+def enrich_ride_with_driver(ride: dict):
+    driver_id = ride.get("driver_id")
+    if not driver_id:
+        return ride
+    try:
+        d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,stringee_user_id,current_latitude,current_longitude").eq("id", driver_id).execute()
+        if not d_res.data:
+            d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,stringee_user_id,current_latitude,current_longitude").eq("driver_id", driver_id).execute()
+        if d_res.data:
+            d = d_res.data[0]
+            ride["driver_name"] = d.get("name") or ride.get("driver_name")
+            ride["driver_phone"] = d.get("phone") or ride.get("driver_phone")
+            ride["vehicle_number"] = d.get("vehicle_number") or ride.get("vehicle_number")
+            ride["vehicle_type"] = ride.get("vehicle_type") or d.get("vehicle_type")
+            ride["driver_photo"] = d.get("photo_url")
+            ride["photo_url"] = d.get("photo_url")
+            ride["driver_photo_url"] = d.get("photo_url")
+            ride["driver_stringee_user_id"] = d.get("stringee_user_id") or ride.get("driver_stringee_user_id")
+            ride["driver_current_latitude"] = d.get("current_latitude")
+            ride["driver_current_longitude"] = d.get("current_longitude")
+    except Exception as e:
+        print(f"enrich error {e}")
+    return ride
 
 class ConnectionManager:
     def __init__(self):
@@ -323,7 +348,6 @@ async def auto_timeout_checker():
     while True:
         try:
             now = datetime.now(timezone.utc)
-            # Pending Timeout 10 min
             pending_res = supabase.table("rides").select("id,created_at,scheduled_time,status").eq("status", "pending").limit(100).execute()
             for r in pending_res.data or []:
                 ride_id = r['id']
@@ -360,8 +384,6 @@ async def auto_timeout_checker():
                         await manager.broadcast_ride_taken(ride_id)
                     except:
                         pass
-
-            # Rider Accepted but Driver not confirmed in 2 min -> back to pending
             try:
                 rider_acc_res = supabase.table("rides").select("id,offer_expires_at,driver_id").eq("status", "rider_accepted").limit(50).execute()
                 for r in rider_acc_res.data or []:
@@ -378,7 +400,6 @@ async def auto_timeout_checker():
                                     supabase.table("driver_offers").delete().eq("ride_id", r["id"]).execute()
                                 except:
                                     pass
-                                # वापस सब Driver को New Ride भेजो
                                 try:
                                     new_data = supabase.table("rides").select("*").eq("id", r["id"]).execute().data
                                     if new_data:
@@ -390,7 +411,6 @@ async def auto_timeout_checker():
                         print(f"rider_accepted timeout error {e}")
             except Exception as e:
                 print(f"rider_accepted check error {e}")
-
         except:
             pass
         await asyncio.sleep(30)
@@ -398,7 +418,7 @@ async def auto_timeout_checker():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("Rivo API 21.0 Double Confirmation 2min OK")
+    print("Rivo API 22.0 With Driver Photo OK")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -408,7 +428,7 @@ async def check_timeout_now():
 
 @app.get("/")
 def root():
-    return {"status":"Rivo API 21.0 Double Confirmation 2min OK"}
+    return {"status":"Rivo API 22.0 With Driver Photo OK"}
 
 # ========== BIDDING SYSTEM ==========
 @app.put("/rides/{ride_id}/offer")
@@ -418,14 +438,11 @@ async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
         raise HTTPException(404, "Ride नहीं मिली")
     if r_res.data[0].get("status")!= "pending":
         raise HTTPException(400, "Ride pending में नहीं है")
-    # Driver busy check
     busy = supabase.table("rides").select("id").eq("driver_id", payload.driver_id).in_("status", ["accepted","started","arrived","rider_accepted"]).limit(1).execute()
     if busy.data:
-        # अगर यही Ride है तो Allow करो वरना Block
         same = supabase.table("rides").select("id").eq("id", ride_id).eq("driver_id", payload.driver_id).execute()
         if not same.data:
             raise HTTPException(409, "आप पहले से एक Ride पर हैं")
-
     offer_data = {
         "ride_id": ride_id,
         "driver_id": payload.driver_id,
@@ -437,6 +454,20 @@ async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
     supabase.table("driver_offers").upsert(offer_data, on_conflict="ride_id,driver_id").execute()
     offers_res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute()
     offers = offers_res.data or []
+    # enrich offers with photo
+    for offer in offers:
+        try:
+            d_id = offer.get("driver_id")
+            d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("id", d_id).execute()
+            if not d_res.data:
+                d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("driver_id", d_id).execute()
+            if d_res.data:
+                offer["driver_photo"] = d_res.data[0].get("photo_url")
+                offer["photo_url"] = d_res.data[0].get("photo_url")
+                offer["vehicle_number"] = offer.get("vehicle_number") or d_res.data[0].get("vehicle_number")
+                offer["driver_name"] = d_res.data[0].get("name") or offer.get("driver_name")
+        except:
+            pass
     await manager.broadcast_new_offer(ride_id, offers)
     await manager.broadcast(ride_id, {"type":"new_driver_offer","ride_id":ride_id,"offers":offers})
     return {"success": True, "offers": offers, "count": len(offers)}
@@ -444,23 +475,33 @@ async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
 @app.get("/rides/{ride_id}/offers")
 def get_ride_offers(ride_id: int):
     res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).limit(50).execute()
-    return {"ride_id": ride_id, "offers": res.data or [], "count": len(res.data or [])}
+    offers = res.data or []
+    for offer in offers:
+        try:
+            d_id = offer.get("driver_id")
+            d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("id", d_id).execute()
+            if not d_res.data:
+                d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("driver_id", d_id).execute()
+            if d_res.data:
+                offer["driver_photo"] = d_res.data[0].get("photo_url")
+                offer["photo_url"] = d_res.data[0].get("photo_url")
+                offer["vehicle_number"] = d_res.data[0].get("vehicle_number")
+                offer["driver_name"] = d_res.data[0].get("name") or offer.get("driver_name")
+        except:
+            pass
+    return {"ride_id": ride_id, "offers": offers, "count": len(offers)}
 
 @app.put("/rides/{ride_id}/accept-offer")
 async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token").eq("id", payload.driver_id).execute()
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token,photo_url,stringee_user_id").eq("id", payload.driver_id).execute()
     if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token").eq("driver_id", payload.driver_id).execute()
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token,photo_url,stringee_user_id").eq("driver_id", payload.driver_id).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
-
-    # Driver Free Check
     busy = supabase.table("rides").select("id").eq("driver_id", driver["id"]).in_("status", ["accepted","started","arrived","rider_accepted"]).limit(1).execute()
     if busy.data:
         raise HTTPException(409, "Driver दूसरी Ride पर है, दूसरा Offer चुनो")
-
-    # Rider Accepted - 2 min timer
     updated = supabase.table("rides").update({
         "driver_id": driver["id"],
         "driver_name": driver.get("name"),
@@ -471,13 +512,10 @@ async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
         "rider_accepted_at": datetime.now(timezone.utc).isoformat(),
         "offer_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
     }).eq("id", ride_id).eq("status","pending").execute()
-
     if not updated.data:
         raise HTTPException(409, "Ride पहले ही ले ली गई")
-
     ride_data = updated.data[0]
-
-    # Winning Driver को Confirmation भेजो
+    ride_data = enrich_ride_with_driver(ride_data)
     for d in list(manager.driver_connections):
         if d.get("driver_id") == driver["id"] or d.get("driver_id") == payload.driver_id:
             try:
@@ -490,8 +528,6 @@ async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
                 }))
             except:
                 pass
-
-    # FCM
     try:
         if driver.get("fcm_token"):
             msg = messaging.Message(
@@ -502,10 +538,7 @@ async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
             messaging.send(msg)
     except Exception as e:
         print(f"FCM offer accept error {e}")
-
-    # बाकी Drivers को बताओ Ride Hold पर है
     await manager.broadcast_ride_taken(ride_id)
-
     return {"success": True, "ride": ride_data, "message": "Driver confirmation का इंतजार है (2 min)"}
 
 @app.put("/rides/{ride_id}/driver-final-accept")
@@ -513,7 +546,6 @@ async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
     r_res = supabase.table("rides").select("*").eq("id", ride_id).eq("status", "rider_accepted").eq("driver_id", driver_id).execute()
     if not r_res.data:
         raise HTTPException(409, "Time Out! Ride वापस Pending में चली गई")
-
     ride = r_res.data[0]
     try:
         exp_str = ride.get("offer_expires_at")
@@ -529,7 +561,6 @@ async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
         raise
     except Exception as e:
         print(f"final accept time check error {e}")
-
     driver_token, driver_clean_id = generate_stringee_token(driver_id, str(ride_id))
     updated = supabase.table("rides").update({
         "status": "accepted",
@@ -538,21 +569,18 @@ async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
         "driver_stringee_user_id": driver_clean_id,
         "offer_expires_at": None
     }).eq("id", ride_id).execute()
-
     if not updated.data:
         raise HTTPException(409, "Failed")
-
     try:
         supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
     except:
         pass
-
     await manager.broadcast_ride_taken(ride_id)
-    return {"success": True, "ride": updated.data[0]}
+    ride_final = enrich_ride_with_driver(updated.data[0])
+    return {"success": True, "ride": ride_final}
 
 @app.put("/rides/{ride_id}/driver-reject-offer")
 async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
-    # Ride वापस Pending
     supabase.table("rides").update({
         "status":"pending",
         "driver_id": None,
@@ -562,13 +590,20 @@ async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
         "offer_expires_at": None,
         "rider_accepted_at": None
     }).eq("id", ride_id).eq("status","rider_accepted").eq("driver_id", driver_id).execute()
-
     supabase.table("driver_offers").delete().eq("ride_id", ride_id).eq("driver_id", driver_id).execute()
-
-    # 1. Driver को तो पता ही है उसने Reject किया
-    # 2. Rider को बताओ Driver Busy है / Reject कर दिया
-    remaining_offers = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute().data or []
-
+    remaining_res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute()
+    remaining_offers = remaining_res.data or []
+    for offer in remaining_offers:
+        try:
+            d_id = offer.get("driver_id")
+            d_res = supabase.table("drivers").select("photo_url,vehicle_number,name").eq("id", d_id).execute()
+            if not d_res.data:
+                d_res = supabase.table("drivers").select("photo_url,vehicle_number,name").eq("driver_id", d_id).execute()
+            if d_res.data:
+                offer["driver_photo"] = d_res.data[0].get("photo_url")
+                offer["photo_url"] = d_res.data[0].get("photo_url")
+        except:
+            pass
     await manager.broadcast(ride_id, {
         "type": "driver_rejected",
         "ride_id": ride_id,
@@ -576,8 +611,6 @@ async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
         "message": "Driver Busy है, दूसरा Offer चुनो",
         "offers": remaining_offers
     })
-
-    # 3. बाकी Drivers को फिर से New Ride भेजो
     try:
         new_data = supabase.table("rides").select("*").eq("id", ride_id).execute().data
         if new_data:
@@ -585,10 +618,7 @@ async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
             send_fcm_global(new_data[0], new_data[0].get('vehicle_type',''))
     except Exception as e:
         print(f"broadcast new ride error {e}")
-
     return {"success": True, "message": "Rejected, Ride वापस Pending में", "offers": remaining_offers}
-
-
 
 # ========== EXISTING APIS ==========
 @app.put("/rides/{ride_id}/complete")
@@ -781,14 +811,14 @@ def get_ride(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
     if not res.data:
         raise HTTPException(404, "Ride not found")
-    return res.data[0]
+    return enrich_ride_with_driver(res.data[0])
 
 @app.get("/rides/ongoing/{user_id}")
 def get_ongoing(user_id: str):
     res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived","rider_accepted"]).order("id", desc=True).limit(1).execute()
     if not res.data:
         return None
-    return res.data[0]
+    return enrich_ride_with_driver(res.data[0])
 
 @app.post("/rides")
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
@@ -867,9 +897,9 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
 
 @app.put("/rides/{ride_id}/accept")
 async def accept_ride(ride_id: int, driver_id: str=Query(...)):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id",driver_id).execute()
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("id",driver_id).execute()
     if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id",driver_id).execute()
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("driver_id",driver_id).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
@@ -892,13 +922,14 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     except:
         pass
     await manager.broadcast_ride_taken(ride_id)
-    return {"success":True, "ride":updated.data[0]}
+    final_ride = enrich_ride_with_driver(updated.data[0])
+    return {"success":True, "ride":final_ride}
 
 @app.put("/rides/{ride_id}/accept-pool")
 def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id: str = Query(...)):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id",driver_id).execute()
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("id",driver_id).execute()
     if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id",driver_id).execute()
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("driver_id",driver_id).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
@@ -925,7 +956,8 @@ def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id:
         supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
     except:
         pass
-    return {"success": True, "ride": res.data[0], "booked": booked + int(res.data[0].get("seats_booked") or 1), "total": max_seats}
+    final_ride = enrich_ride_with_driver(res.data[0])
+    return {"success": True, "ride": final_ride, "booked": booked + int(res.data[0].get("seats_booked") or 1), "total": max_seats}
 
 @app.get("/rides/pool/along-route/{active_ride_id}")
 def get_pool_rides_along_route(active_ride_id: int, driver_id: str = Query(...), driver_lat: float = Query(None), driver_lng: float = Query(None), farthest_drop_lat: float = Query(None), farthest_drop_lng: float = Query(None)):
@@ -1009,11 +1041,11 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 def get_active_ride(driver_id: str):
     res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
     if res.data:
-        # rider_accepted को भी active मानो ताकि Driver को Confirmation Screen दिखे
-        for r in res.data:
+        enriched = [enrich_ride_with_driver(r) for r in res.data]
+        for r in enriched:
             if r.get("status") == "rider_accepted":
-                return {"active": True, "rides": res.data, "ride": r, "need_final_confirm": True}
-        return {"active": True, "rides": res.data, "ride": res.data[0]}
+                return {"active": True, "rides": enriched, "ride": r, "need_final_confirm": True}
+        return {"active": True, "rides": enriched, "ride": enriched[0]}
     return {"active": False, "rides": [], "ride": None}
 
 @app.websocket("/ws/drivers")
@@ -1063,15 +1095,15 @@ def get_driver_location_for_ride(ride_id: int):
         driver_id = ride_res.data[0].get("driver_id")
         if not driver_id:
             return {"lat": None, "lng": None, "current_latitude": None, "current_longitude": None}
-        d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen").eq("id", driver_id).execute()
+        d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen,photo_url").eq("id", driver_id).execute()
         if not d_res.data:
-            d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen").eq("driver_id", driver_id).execute()
+            d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen,photo_url").eq("driver_id", driver_id).execute()
         if not d_res.data:
             raise HTTPException(404, "Driver not found")
         d = d_res.data[0]
         lat = d.get("current_latitude")
         lng = d.get("current_longitude")
-        return {"driver_id": driver_id,"lat": lat,"lng": lng,"current_latitude": lat,"current_longitude": lng,"latitude": lat,"longitude": lng,"last_seen": d.get("last_seen")}
+        return {"driver_id": driver_id,"lat": lat,"lng": lng,"current_latitude": lat,"current_longitude": lng,"latitude": lat,"longitude": lng,"last_seen": d.get("last_seen"),"driver_photo": d.get("photo_url"),"photo_url": d.get("photo_url")}
     except HTTPException:
         raise
     except Exception as e:
@@ -1099,11 +1131,11 @@ def get_ride_with_driver_location(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
     if not res.data:
         raise HTTPException(404, "Ride not found")
-    ride = res.data[0]
+    ride = enrich_ride_with_driver(res.data[0])
     driver_id = ride.get("driver_id")
     if driver_id:
         try:
-            d_res = supabase.table("drivers").select("current_latitude,current_longitude,current_lat,current_lng").eq("id", driver_id).execute()
+            d_res = supabase.table("drivers").select("current_latitude,current_longitude").eq("id", driver_id).execute()
             if not d_res.data:
                 d_res = supabase.table("drivers").select("current_latitude,current_longitude").eq("driver_id", driver_id).execute()
             if d_res.data:
@@ -1216,7 +1248,13 @@ def get_all_rides_admin(status: str = Query(None), limit: int = Query(100)):
         if status and status != "all":
             q = q.eq("status", status)
         res = q.execute()
-        return res.data or []
+        rides = res.data or []
+        enriched = []
+        for r in rides:
+            if r.get("driver_id"):
+                r = enrich_ride_with_driver(r)
+            enriched.append(r)
+        return enriched
     except Exception as e:
         return {"error": str(e)}
 
