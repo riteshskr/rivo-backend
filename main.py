@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 19.1 Driver Stringee Fixed")
+app = FastAPI(title="Rivo Taxi API - Final 20.0 Bidding + Driver Offers Table")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -119,6 +119,13 @@ class ConnectionManager:
             for c in list(self.active_connections[ride_id]):
                 try:
                     await c.send_text(json.dumps(msg))
+                except:
+                    pass
+    async def broadcast_new_offer(self, ride_id: int, offers: list):
+        if ride_id in self.active_connections:
+            for c in list(self.active_connections[ride_id]):
+                try:
+                    await c.send_text(json.dumps({"type":"new_driver_offer","ride_id":ride_id,"offers":offers}))
                 except:
                     pass
     async def connect_driver(self, ws: WebSocket, vehicle_type: str = "", lat: float = None, lng: float = None, driver_range: float = None, driver_id: str = ""):
@@ -247,6 +254,16 @@ class DriverLocationRequest(BaseModel):
     latitude: Optional[float]=None
     longitude: Optional[float]=None
 
+class DriverOfferRequest(BaseModel):
+    driver_id: str
+    driver_name: Optional[str]=None
+    offered_fare: float
+    vehicle_type: Optional[str]=None
+
+class AcceptOfferRequest(BaseModel):
+    driver_id: str
+    offered_fare: float
+
 class PoolDropRequest(BaseModel):
     driver_id: str
 
@@ -290,6 +307,10 @@ def archive_and_delete_ride(ride_id: int):
             supabase.table("rides").delete().eq("id", int(original_id)).execute()
         except:
             pass
+        try:
+            supabase.table("driver_offers").delete().eq("ride_id", int(original_id)).execute()
+        except:
+            pass
     except Exception as e:
         print(f"Archive Error {e}")
 
@@ -328,6 +349,10 @@ async def auto_timeout_checker():
                 if should_timeout:
                     try:
                         supabase.table("rides").update({"status": "timeout"}).eq("id", ride_id).execute()
+                        try:
+                            supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+                        except:
+                            pass
                         archive_and_delete_ride(ride_id)
                         await manager.broadcast_ride_taken(ride_id)
                     except:
@@ -339,7 +364,7 @@ async def auto_timeout_checker():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("Rivo API 19.1 Driver Stringee Fixed OK")
+    print("Rivo API 20.0 Bidding Table OK")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -347,6 +372,68 @@ async def check_timeout_now():
     pending = supabase.table("rides").select("id,created_at,scheduled_time,seats_booked,total_seats,pool_group_id").eq("status", "pending").execute().data or []
     return {"now_utc": now.isoformat(), "pending_count": len(pending), "rides": pending}
 
+@app.get("/")
+def root():
+    return {"status":"Rivo API 20.0 Bidding Table OK"}
+
+# ========== BIDDING SYSTEM ==========
+@app.put("/rides/{ride_id}/offer")
+async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
+    r_res = supabase.table("rides").select("id,status").eq("id", ride_id).execute()
+    if not r_res.data:
+        raise HTTPException(404, "Ride नहीं मिली")
+    if r_res.data[0].get("status")!= "pending":
+        raise HTTPException(400, "Ride pending में नहीं है")
+    offer_data = {
+        "ride_id": ride_id,
+        "driver_id": payload.driver_id,
+        "driver_name": payload.driver_name or payload.driver_id,
+        "vehicle_type": payload.vehicle_type or "Mini",
+        "offered_fare": float(payload.offered_fare),
+        "status": "pending"
+    }
+    supabase.table("driver_offers").upsert(offer_data, on_conflict="ride_id,driver_id").execute()
+    offers_res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute()
+    offers = offers_res.data or []
+    await manager.broadcast_new_offer(ride_id, offers)
+    await manager.broadcast(ride_id, {"type":"new_driver_offer","ride_id":ride_id,"offers":offers})
+    return {"success": True, "offers": offers, "count": len(offers)}
+
+@app.get("/rides/{ride_id}/offers")
+def get_ride_offers(ride_id: int):
+    res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).limit(50).execute()
+    return {"ride_id": ride_id, "offers": res.data or [], "count": len(res.data or [])}
+
+@app.put("/rides/{ride_id}/accept-offer")
+async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id", payload.driver_id).execute()
+    if not d_res.data:
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id", payload.driver_id).execute()
+    if not d_res.data:
+        raise HTTPException(404, "Driver not found")
+    driver = d_res.data[0]
+    driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
+    updated = supabase.table("rides").update({
+        "driver_id": driver["id"],
+        "driver_name": driver.get("name"),
+        "driver_phone": driver.get("phone"),
+        "vehicle_number": driver.get("vehicle_number"),
+        "fare": float(payload.offered_fare),
+        "status": "accepted",
+        "accepted_at": datetime.now(timezone.utc).isoformat(),
+        "driver_stringee_token": driver_token,
+        "driver_stringee_user_id": driver_clean_id
+    }).eq("id", ride_id).eq("status","pending").execute()
+    if not updated.data:
+        raise HTTPException(409, "Ride पहले ही ले ली गई")
+    try:
+        supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+    except:
+        pass
+    await manager.broadcast_ride_taken(ride_id)
+    return {"success": True, "ride": updated.data[0]}
+
+# ========== EXISTING APIS ==========
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
     supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat(), "passenger_status": "dropped"}).eq("id",ride_id).execute()
@@ -360,13 +447,7 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
         raise HTTPException(404, "Ride नहीं मिली")
     ride = res.data[0]
     gid = group_id or ride.get("pool_group_id")
-
-    supabase.table("rides").update({
-        "status": "completed",
-        "passenger_status": "dropped",
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", ride_id).execute()
-
+    supabase.table("rides").update({"status": "completed","passenger_status": "dropped","completed_at": datetime.now(timezone.utc).isoformat(),}).eq("id", ride_id).execute()
     if background_tasks is not None:
         background_tasks.add_task(archive_and_delete_ride, ride_id)
     else:
@@ -374,7 +455,6 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
             archive_and_delete_ride(ride_id)
         except Exception:
             pass
-
     booked = 0
     total = 4
     if gid:
@@ -383,32 +463,17 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
         booked = sum([int(r.get("seats_booked") or 1) for r in remaining_data])
         if remaining_data:
             total = int(remaining_data[0].get("total_seats") or remaining_data[0].get("max_pool_seats") or 4)
-
-    return {
-        "success": True,
-        "ride_id": ride_id,
-        "status": "completed",
-        "booked_seats": booked,
-        "total_seats": total,
-        "left_seats": total - booked
-    }
-
-
-
-
+    return {"success": True,"ride_id": ride_id,"status": "completed","booked_seats": booked,"total_seats": total,"left_seats": total - booked}
 
 @app.get("/rides/pool/group/{group_id}/driver/{driver_id}")
 def get_my_pooled_rides(group_id: str, driver_id: str):
-    # सिर्फ Active rides लाओ, Completed को बिलकुल मत लाओ
     res = supabase.table("rides").select("*").eq("pool_group_id", group_id).eq("driver_id", driver_id).in_("status", ["accepted","started","arrived","pending"]).order("id", desc=False).execute()
     rides = res.data or []
-    active = rides # अब rides ही active है
-
+    active = rides
     booked = sum([int(r.get("seats_booked") or 1) for r in active])
     total = 4
     if active:
         total = int(active[0].get("total_seats") or active[0].get("max_pool_seats") or 4)
-
     farthest = None
     max_dist = 0
     if active:
@@ -424,13 +489,15 @@ def get_my_pooled_rides(group_id: str, driver_id: str):
                     farthest = {"lat": d_lat, "lng": d_lng, "ride_id": r["id"]}
             except:
                 pass
-
-    # अब rides में सिर्फ active ही जाएगा
     return {"rides": active,"booked_seats": booked,"total_seats": total,"left_seats": total - booked,"farthest_drop": farthest,"active_count": len(active),"total_count": len(active)}
 
 @app.put("/rides/{ride_id}/cancel")
 def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
     supabase.table("rides").update({"status": "cancelled"}).eq("id", ride_id).execute()
+    try:
+        supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+    except:
+        pass
     try:
         background_tasks.add_task(archive_and_delete_ride, ride_id)
     except:
@@ -440,6 +507,10 @@ def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = 
 @app.put("/rides/{ride_id}/timeout")
 def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
     supabase.table("rides").update({"status":"timeout"}).eq("id", ride_id).execute()
+    try:
+        supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+    except:
+        pass
     background_tasks.add_task(archive_and_delete_ride, ride_id)
     return {"success": True}
 
@@ -657,27 +728,25 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
     updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
     if not updated.data:
         raise HTTPException(409, "Already taken")
+    try:
+        supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+    except:
+        pass
     await manager.broadcast_ride_taken(ride_id)
     return {"success":True, "ride":updated.data[0]}
 
 @app.put("/rides/{ride_id}/accept-pool")
 def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id: str = Query(...)):
-    # 1. Driver का पूरा data निकालो
     d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id",driver_id).execute()
     if not d_res.data:
         d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id",driver_id).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
-
-    # 2. Seats check
     group_rides = supabase.table("rides").select("seats_booked,total_seats,max_pool_seats").eq("pool_group_id", group_id).in_("status",["accepted","started"]).execute().data or []
     booked = sum([int(r.get("seats_booked") or 1) for r in group_rides])
     max_seats = int(group_rides[0].get("total_seats") or group_rides[0].get("max_pool_seats") or 4) if group_rides else 4
-
     driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
-
-    # 3. YAHI MAIN FIX - Driver details ke sath update
     res = supabase.table("rides").update({
         "driver_id": driver["id"],
         "driver_name": driver.get("name"),
@@ -691,13 +760,13 @@ def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id:
         "driver_stringee_token": driver_token,
         "driver_stringee_user_id": driver_clean_id
     }).eq("id", ride_id).eq("status","pending").execute()
-
     if not res.data:
         raise HTTPException(409, "Already taken or seat full")
-
+    try:
+        supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+    except:
+        pass
     return {"success": True, "ride": res.data[0], "booked": booked + int(res.data[0].get("seats_booked") or 1), "total": max_seats}
-
-
 
 @app.get("/rides/pool/along-route/{active_ride_id}")
 def get_pool_rides_along_route(active_ride_id: int, driver_id: str = Query(...), driver_lat: float = Query(None), driver_lng: float = Query(None), farthest_drop_lat: float = Query(None), farthest_drop_lng: float = Query(None)):
@@ -814,10 +883,6 @@ async def ws_ride(ws: WebSocket, ride_id: int):
     except WebSocketDisconnect:
         manager.disconnect(ride_id, ws)
 
-@app.get("/")
-def root():
-    return {"status":"Rivo API 19.1 Driver Stringee Fixed OK"}
-
 @app.get("/admin/archived")
 def get_archived():
     try:
@@ -825,6 +890,7 @@ def get_archived():
         return res.data
     except Exception as e:
         return {"error": str(e)}
+
 @app.get("/rides/{ride_id}/driver-location")
 def get_driver_location_for_ride(ride_id: int):
     try:
@@ -834,60 +900,36 @@ def get_driver_location_for_ride(ride_id: int):
         driver_id = ride_res.data[0].get("driver_id")
         if not driver_id:
             return {"lat": None, "lng": None, "current_latitude": None, "current_longitude": None}
-        
         d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen").eq("id", driver_id).execute()
         if not d_res.data:
             d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen").eq("driver_id", driver_id).execute()
         if not d_res.data:
             raise HTTPException(404, "Driver not found")
-        
         d = d_res.data[0]
         lat = d.get("current_latitude")
         lng = d.get("current_longitude")
-        return {
-            "driver_id": driver_id,
-            "lat": lat,
-            "lng": lng,
-            "current_latitude": lat,
-            "current_longitude": lng,
-            "latitude": lat,
-            "longitude": lng,
-            "last_seen": d.get("last_seen")
-        }
+        return {"driver_id": driver_id,"lat": lat,"lng": lng,"current_latitude": lat,"current_longitude": lng,"latitude": lat,"longitude": lng,"last_seen": d.get("last_seen")}
     except HTTPException:
         raise
     except Exception as e:
         print(f"driver-location error {e}")
         raise HTTPException(500, str(e))
 
-# Also enrich /rides/{ride_id} to include driver live location
-
 @app.put("/rides/pool/group/{group_id}/complete")
 def complete_pool_group(group_id: str, driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
     try:
-        # उस group की सारी active rides निकालो
         res = supabase.table("rides").select("id").eq("pool_group_id", group_id).in_("status", ["accepted","started","arrived","pending"]).execute()
         rides = res.data or []
-
         if not rides:
             return {"success": True, "message": "Already completed"}
-
-        # सभी को completed करो
         for r in rides:
-            supabase.table("rides").update({
-                "status": "completed",
-                "passenger_status": "dropped",
-                "completed_at": datetime.now(timezone.utc).isoformat()
-            }).eq("id", r["id"]).execute()
-            # चाहो तो archive भी कर सकते हो
+            supabase.table("rides").update({"status": "completed","passenger_status": "dropped","completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", r["id"]).execute()
             if background_tasks:
                 background_tasks.add_task(archive_and_delete_ride, r["id"])
-
         return {"success": True, "completed_count": len(rides), "group_id": group_id}
     except Exception as e:
         print(f"Group Complete Error {e}")
         raise HTTPException(500, str(e))
-
 
 @app.get("/rides/{ride_id}/with-driver-location")
 def get_ride_with_driver_location(ride_id: int):
