@@ -108,9 +108,9 @@ def enrich_ride_with_driver(ride: dict):
     if not driver_id:
         return ride
     try:
-        d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,stringee_user_id,current_latitude,current_longitude").eq("id", driver_id).execute()
+        d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,current_latitude,current_longitude").eq("id", driver_id).execute()
         if not d_res.data:
-            d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,stringee_user_id,current_latitude,current_longitude").eq("driver_id", driver_id).execute()
+            d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,current_latitude,current_longitude").eq("driver_id", driver_id).execute()
         if d_res.data:
             d = d_res.data[0]
             ride["driver_name"] = d.get("name") or ride.get("driver_name")
