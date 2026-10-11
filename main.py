@@ -549,17 +549,44 @@ async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
     return {"success": True, "ride": updated.data[0]}
 
 @app.put("/rides/{ride_id}/driver-reject-offer")
-def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
-    supabase.table("rides").update({"status":"pending", "driver_id": None, "driver_name": None, "driver_phone": None, "vehicle_number": None, "offer_expires_at": None}).eq("id", ride_id).eq("status","rider_accepted").eq("driver_id", driver_id).execute()
+async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
+    # Ride वापस Pending
+    supabase.table("rides").update({
+        "status":"pending",
+        "driver_id": None,
+        "driver_name": None,
+        "driver_phone": None,
+        "vehicle_number": None,
+        "offer_expires_at": None,
+        "rider_accepted_at": None
+    }).eq("id", ride_id).eq("status","rider_accepted").eq("driver_id", driver_id).execute()
+
     supabase.table("driver_offers").delete().eq("ride_id", ride_id).eq("driver_id", driver_id).execute()
-    # Ride वापस Pending - फिर से broadcast
+
+    # 1. Driver को तो पता ही है उसने Reject किया
+    # 2. Rider को बताओ Driver Busy है / Reject कर दिया
+    remaining_offers = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute().data or []
+
+    await manager.broadcast(ride_id, {
+        "type": "driver_rejected",
+        "ride_id": ride_id,
+        "rejected_driver_id": driver_id,
+        "message": "Driver Busy है, दूसरा Offer चुनो",
+        "offers": remaining_offers
+    })
+
+    # 3. बाकी Drivers को फिर से New Ride भेजो
     try:
         new_data = supabase.table("rides").select("*").eq("id", ride_id).execute().data
         if new_data:
-            asyncio.create_task(manager.broadcast_new_ride(new_data[0]))
-    except:
-        pass
-    return {"success": True, "message": "Rejected, Ride वापस Pending में"}
+            await manager.broadcast_new_ride(new_data[0])
+            send_fcm_global(new_data[0], new_data[0].get('vehicle_type',''))
+    except Exception as e:
+        print(f"broadcast new ride error {e}")
+
+    return {"success": True, "message": "Rejected, Ride वापस Pending में", "offers": remaining_offers}
+
+
 
 # ========== EXISTING APIS ==========
 @app.put("/rides/{ride_id}/complete")
