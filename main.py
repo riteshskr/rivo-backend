@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 20.0 Bidding + Driver Offers Table")
+app = FastAPI(title="Rivo Taxi API - Final 21.0 Double Confirmation 2min")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -321,6 +321,7 @@ async def auto_timeout_checker():
     while True:
         try:
             now = datetime.now(timezone.utc)
+            # Pending Timeout 10 min
             pending_res = supabase.table("rides").select("id,created_at,scheduled_time,status").eq("status", "pending").limit(100).execute()
             for r in pending_res.data or []:
                 ride_id = r['id']
@@ -357,6 +358,37 @@ async def auto_timeout_checker():
                         await manager.broadcast_ride_taken(ride_id)
                     except:
                         pass
+
+            # Rider Accepted but Driver not confirmed in 2 min -> back to pending
+            try:
+                rider_acc_res = supabase.table("rides").select("id,offer_expires_at,driver_id").eq("status", "rider_accepted").limit(50).execute()
+                for r in rider_acc_res.data or []:
+                    try:
+                        exp_str = r.get("offer_expires_at")
+                        if exp_str:
+                            exp_dt = datetime.fromisoformat(str(exp_str).replace('Z','+00:00'))
+                            if exp_dt.tzinfo is None:
+                                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                            if now >= exp_dt:
+                                print(f"Offer Expired for ride {r['id']}")
+                                supabase.table("rides").update({"status":"pending", "driver_id": None, "driver_name": None, "driver_phone": None, "vehicle_number": None, "offer_expires_at": None}).eq("id", r["id"]).execute()
+                                try:
+                                    supabase.table("driver_offers").delete().eq("ride_id", r["id"]).execute()
+                                except:
+                                    pass
+                                # वापस सब Driver को New Ride भेजो
+                                try:
+                                    new_data = supabase.table("rides").select("*").eq("id", r["id"]).execute().data
+                                    if new_data:
+                                        await manager.broadcast_new_ride(new_data[0])
+                                        send_fcm_global(new_data[0], new_data[0].get('vehicle_type',''))
+                                except:
+                                    pass
+                    except Exception as e:
+                        print(f"rider_accepted timeout error {e}")
+            except Exception as e:
+                print(f"rider_accepted check error {e}")
+
         except:
             pass
         await asyncio.sleep(30)
@@ -364,17 +396,17 @@ async def auto_timeout_checker():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("Rivo API 20.0 Bidding Table OK")
+    print("Rivo API 21.0 Double Confirmation 2min OK")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
     now = datetime.now(timezone.utc)
-    pending = supabase.table("rides").select("id,created_at,scheduled_time,seats_booked,total_seats,pool_group_id").eq("status", "pending").execute().data or []
+    pending = supabase.table("rides").select("id,created_at,scheduled_time,seats_booked,total_seats,pool_group_id,status").in_("status", ["pending","rider_accepted"]).execute().data or []
     return {"now_utc": now.isoformat(), "pending_count": len(pending), "rides": pending}
 
 @app.get("/")
 def root():
-    return {"status":"Rivo API 20.0 Bidding Table OK"}
+    return {"status":"Rivo API 21.0 Double Confirmation 2min OK"}
 
 # ========== BIDDING SYSTEM ==========
 @app.put("/rides/{ride_id}/offer")
@@ -384,6 +416,14 @@ async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
         raise HTTPException(404, "Ride नहीं मिली")
     if r_res.data[0].get("status")!= "pending":
         raise HTTPException(400, "Ride pending में नहीं है")
+    # Driver busy check
+    busy = supabase.table("rides").select("id").eq("driver_id", payload.driver_id).in_("status", ["accepted","started","arrived","rider_accepted"]).limit(1).execute()
+    if busy.data:
+        # अगर यही Ride है तो Allow करो वरना Block
+        same = supabase.table("rides").select("id").eq("id", ride_id).eq("driver_id", payload.driver_id).execute()
+        if not same.data:
+            raise HTTPException(409, "आप पहले से एक Ride पर हैं")
+
     offer_data = {
         "ride_id": ride_id,
         "driver_id": payload.driver_id,
@@ -406,32 +446,120 @@ def get_ride_offers(ride_id: int):
 
 @app.put("/rides/{ride_id}/accept-offer")
 async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("id", payload.driver_id).execute()
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token").eq("id", payload.driver_id).execute()
     if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type").eq("driver_id", payload.driver_id).execute()
+        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token").eq("driver_id", payload.driver_id).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
-    driver_token, driver_clean_id = generate_stringee_token(driver["id"], str(ride_id))
+
+    # Driver Free Check
+    busy = supabase.table("rides").select("id").eq("driver_id", driver["id"]).in_("status", ["accepted","started","arrived","rider_accepted"]).limit(1).execute()
+    if busy.data:
+        raise HTTPException(409, "Driver दूसरी Ride पर है, दूसरा Offer चुनो")
+
+    # Rider Accepted - 2 min timer
     updated = supabase.table("rides").update({
         "driver_id": driver["id"],
         "driver_name": driver.get("name"),
         "driver_phone": driver.get("phone"),
         "vehicle_number": driver.get("vehicle_number"),
         "fare": float(payload.offered_fare),
+        "status": "rider_accepted",
+        "rider_accepted_at": datetime.now(timezone.utc).isoformat(),
+        "offer_expires_at": (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat(),
+    }).eq("id", ride_id).eq("status","pending").execute()
+
+    if not updated.data:
+        raise HTTPException(409, "Ride पहले ही ले ली गई")
+
+    ride_data = updated.data[0]
+
+    # Winning Driver को Confirmation भेजो
+    for d in list(manager.driver_connections):
+        if d.get("driver_id") == driver["id"] or d.get("driver_id") == payload.driver_id:
+            try:
+                await d["ws"].send_text(json.dumps({
+                    "type": "rider_accepted_your_offer",
+                    "ride_id": ride_id,
+                    "ride": ride_data,
+                    "offered_fare": float(payload.offered_fare),
+                    "expires_in": 120
+                }))
+            except:
+                pass
+
+    # FCM
+    try:
+        if driver.get("fcm_token"):
+            msg = messaging.Message(
+                notification=messaging.Notification(title="Offer Accepted! 🎉", body=f"Rider ने आपका ₹{payload.offered_fare} वाला Offer Accept किया, 2 मिनट में Confirm करो"),
+                data={"type": "rider_accepted_your_offer", "ride_id": str(ride_id), "fare": str(payload.offered_fare)},
+                token=driver.get("fcm_token")
+            )
+            messaging.send(msg)
+    except Exception as e:
+        print(f"FCM offer accept error {e}")
+
+    # बाकी Drivers को बताओ Ride Hold पर है
+    await manager.broadcast_ride_taken(ride_id)
+
+    return {"success": True, "ride": ride_data, "message": "Driver confirmation का इंतजार है (2 min)"}
+
+@app.put("/rides/{ride_id}/driver-final-accept")
+async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
+    r_res = supabase.table("rides").select("*").eq("id", ride_id).eq("status", "rider_accepted").eq("driver_id", driver_id).execute()
+    if not r_res.data:
+        raise HTTPException(409, "Time Out! Ride वापस Pending में चली गई")
+
+    ride = r_res.data[0]
+    try:
+        exp_str = ride.get("offer_expires_at")
+        if exp_str:
+            exp_dt = datetime.fromisoformat(str(exp_str).replace('Z','+00:00'))
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > exp_dt:
+                supabase.table("rides").update({"status":"pending", "driver_id": None, "driver_name": None, "driver_phone": None, "vehicle_number": None, "offer_expires_at": None}).eq("id", ride_id).execute()
+                supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+                raise HTTPException(409, "2 मिनट खत्म, Ride Expire हो गई")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"final accept time check error {e}")
+
+    driver_token, driver_clean_id = generate_stringee_token(driver_id, str(ride_id))
+    updated = supabase.table("rides").update({
         "status": "accepted",
         "accepted_at": datetime.now(timezone.utc).isoformat(),
         "driver_stringee_token": driver_token,
-        "driver_stringee_user_id": driver_clean_id
-    }).eq("id", ride_id).eq("status","pending").execute()
+        "driver_stringee_user_id": driver_clean_id,
+        "offer_expires_at": None
+    }).eq("id", ride_id).execute()
+
     if not updated.data:
-        raise HTTPException(409, "Ride पहले ही ले ली गई")
+        raise HTTPException(409, "Failed")
+
     try:
         supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
     except:
         pass
+
     await manager.broadcast_ride_taken(ride_id)
     return {"success": True, "ride": updated.data[0]}
+
+@app.put("/rides/{ride_id}/driver-reject-offer")
+def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
+    supabase.table("rides").update({"status":"pending", "driver_id": None, "driver_name": None, "driver_phone": None, "vehicle_number": None, "offer_expires_at": None}).eq("id", ride_id).eq("status","rider_accepted").eq("driver_id", driver_id).execute()
+    supabase.table("driver_offers").delete().eq("ride_id", ride_id).eq("driver_id", driver_id).execute()
+    # Ride वापस Pending - फिर से broadcast
+    try:
+        new_data = supabase.table("rides").select("*").eq("id", ride_id).execute().data
+        if new_data:
+            asyncio.create_task(manager.broadcast_new_ride(new_data[0]))
+    except:
+        pass
+    return {"success": True, "message": "Rejected, Ride वापस Pending में"}
 
 # ========== EXISTING APIS ==========
 @app.put("/rides/{ride_id}/complete")
@@ -467,7 +595,7 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
 
 @app.get("/rides/pool/group/{group_id}/driver/{driver_id}")
 def get_my_pooled_rides(group_id: str, driver_id: str):
-    res = supabase.table("rides").select("*").eq("pool_group_id", group_id).eq("driver_id", driver_id).in_("status", ["accepted","started","arrived","pending"]).order("id", desc=False).execute()
+    res = supabase.table("rides").select("*").eq("pool_group_id", group_id).eq("driver_id", driver_id).in_("status", ["accepted","started","arrived","pending","rider_accepted"]).order("id", desc=False).execute()
     rides = res.data or []
     active = rides
     booked = sum([int(r.get("seats_booked") or 1) for r in active])
@@ -626,7 +754,7 @@ def get_ride(ride_id: int):
 
 @app.get("/rides/ongoing/{user_id}")
 def get_ongoing(user_id: str):
-    res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived"]).order("id", desc=True).limit(1).execute()
+    res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived","rider_accepted"]).order("id", desc=True).limit(1).execute()
     if not res.data:
         return None
     return res.data[0]
@@ -848,8 +976,12 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
-    res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived"]).order("id", desc=True).limit(10).execute()
+    res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
     if res.data:
+        # rider_accepted को भी active मानो ताकि Driver को Confirmation Screen दिखे
+        for r in res.data:
+            if r.get("status") == "rider_accepted":
+                return {"active": True, "rides": res.data, "ride": r, "need_final_confirm": True}
         return {"active": True, "rides": res.data, "ride": res.data[0]}
     return {"active": False, "rides": [], "ride": None}
 
