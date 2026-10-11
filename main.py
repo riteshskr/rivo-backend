@@ -182,11 +182,13 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         if not firebase_admin._apps:
             return
         v_type = vehicle_type.strip().lower()
-        all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range").eq("is_online", True).neq("fcm_token", "").execute().data or []
+        all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range,is_active").eq("is_online", True).neq("fcm_token", "").execute().data or []
         tokens = []
         p_lat = float(ride_data.get('pickup_lat', 0))
         p_lng = float(ride_data.get('pickup_lng', 0))
         for d in all_drivers:
+            if d.get('is_active') == False:
+                continue
             d_v = str(d.get('vehicle_type','')).lower().strip()
             if d_v!= v_type:
                 continue
@@ -688,6 +690,8 @@ def driver_login(payload: DriverLoginRequest):
     driver = res.data[0]
     if str(driver.get('password','')).strip()!= password_input:
         raise HTTPException(401, "Wrong password")
+    if driver.get('is_active') == False:
+        raise HTTPException(403, "आपका Account Admin ने Pause किया है")
     if payload.fcm_token:
         try:
             supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", driver["id"]).execute()
@@ -1114,3 +1118,124 @@ def get_ride_with_driver_location(ride_id: int):
             pass
     return ride
 
+@app.get("/admin/drivers")
+def get_all_drivers_admin():
+    try:
+        res = supabase.table("drivers").select("*").order("id", desc=False).execute()
+        return res.data or []
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/admin/drivers")
+def create_driver_admin(payload: dict):
+    try:
+        if "driver_id" not in payload and "id" in payload:
+            payload["driver_id"] = payload["id"]
+        if "id" not in payload and "driver_id" in payload:
+            payload["id"] = payload["driver_id"]
+        if "is_active" not in payload:
+            payload["is_active"] = True
+        if "is_online" not in payload:
+            payload["is_online"] = True
+        res = supabase.table("drivers").insert(payload).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.put("/admin/drivers/{driver_id}")
+def update_driver_admin(driver_id: str, payload: dict):
+    try:
+        payload.pop("id", None)
+        res = supabase.table("drivers").update(payload).eq("id", driver_id).execute()
+        if not res.data:
+            res = supabase.table("drivers").update(payload).eq("driver_id", driver_id).execute()
+        return res.data or {"success": True}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.put("/admin/drivers/{driver_id}/pause")
+def pause_driver_admin(driver_id: str, payload: dict):
+    try:
+        is_active = payload.get("is_active", True)
+        update_data = {"is_active": is_active, "is_online": is_active}
+        res = supabase.table("drivers").update(update_data).eq("id", driver_id).execute()
+        if not res.data:
+            res = supabase.table("drivers").update(update_data).eq("driver_id", driver_id).execute()
+        if not is_active:
+            manager.driver_connections = [d for d in manager.driver_connections if d.get("driver_id") != driver_id]
+        return {"success": True, "is_active": is_active}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.delete("/admin/drivers/{driver_id}")
+def delete_driver_admin(driver_id: str):
+    try:
+        supabase.table("drivers").delete().eq("id", driver_id).execute()
+        supabase.table("drivers").delete().eq("driver_id", driver_id).execute()
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/admin/vehicles")
+def create_vehicle_admin(payload: dict):
+    try:
+        res = supabase.table("vehicles").insert(payload).execute()
+        return res.data
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.put("/admin/vehicles/{vid}")
+def update_vehicle_admin(vid: str, payload: dict):
+    try:
+        res = supabase.table("vehicles").update(payload).eq("id", vid).execute()
+        if not res.data:
+            try:
+                int_vid = int(vid)
+                res = supabase.table("vehicles").update(payload).eq("id", int_vid).execute()
+            except:
+                res = supabase.table("vehicles").update(payload).eq("name", vid).execute()
+        return res.data or {"success": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.delete("/admin/vehicles/{vid}")
+def delete_vehicle_admin(vid: str):
+    try:
+        supabase.table("vehicles").delete().eq("id", vid).execute()
+    except:
+        try:
+            supabase.table("vehicles").delete().eq("name", vid).execute()
+        except Exception as e:
+            raise HTTPException(400, str(e))
+    return {"success": True}
+
+@app.get("/admin/rides/all")
+def get_all_rides_admin(status: str = Query(None), limit: int = Query(100)):
+    try:
+        q = supabase.table("rides").select("*").order("id", desc=True).limit(limit)
+        if status and status != "all":
+            q = q.eq("status", status)
+        res = q.execute()
+        return res.data or []
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/admin/stats")
+def get_admin_stats():
+    try:
+        pending = supabase.table("rides").select("id", count="exact").eq("status", "pending").execute()
+        accepted = supabase.table("rides").select("id", count="exact").in_("status", ["accepted","started","rider_accepted"]).execute()
+        drivers = supabase.table("drivers").select("id", count="exact").execute()
+        active_drivers = supabase.table("drivers").select("id", count="exact").eq("is_active", True).execute()
+        vehicles = supabase.table("vehicles").select("id", count="exact").execute()
+        archived = supabase.table("rides_archive").select("id", count="exact").execute()
+        return {
+            "pending_rides": pending.count or 0,
+            "active_rides": accepted.count or 0,
+            "total_drivers": drivers.count or 0,
+            "active_drivers": active_drivers.count or 0,
+            "total_vehicles": vehicles.count or 0,
+            "completed_rides": archived.count or 0,
+        }
+    except Exception as e:
+        return {"error": str(e)}
