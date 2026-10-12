@@ -801,9 +801,10 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
 @app.get("/vehicles")
 def get_vehicles():
     try:
-        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, pool_per_km, pool_night_per_km, pool_min_fare, max_pool_seats, icon_path").order("id", desc=False).execute()
+        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, pool_per_km, pool_night_per_km, pool_min_fare, pool_parcel_per_km, pool_parcel_per_km_night, pool_parcel_min_fare, max_pool_seats, icon_path").order("id", desc=False).execute()
         return res.data or []
-    except:
+    except Exception as e:
+        print(f"Error fetching vehicles: {e}")
         return []
 
 @app.get("/rides/{ride_id}")
