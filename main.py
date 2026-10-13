@@ -825,8 +825,18 @@ def get_ongoing(user_id: str):
 async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     token, clean_id = generate_stringee_token(user_id, "new")
     final_trip = "parcel" if "parcel" in payload.trip_type.lower() else "pool" if "pool" in payload.trip_type.lower() else "ride"
+    raw_type = payload.trip_type.lower()
+    if "pool_parcel" in raw_type or "pool parcel" in raw_type:
+        final_trip = "pool_parcel" # Parcel + Pool
+    elif "parcel" in raw_type:
+        final_trip = "parcel" # Parcel Single
+    elif "pool" in raw_type:
+        final_trip = "pool" # Ride Pool
+    else:
+        final_trip = "ride" # Ride 
     v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).limit(1).execute()
     if not v_res.data:
+
         v_res = supabase.table("vehicles").select("*").limit(1).execute()
     vehicle_row = v_res.data[0] if v_res.data else {}
     correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
