@@ -856,7 +856,7 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
         should_offer = has_offer_pool
     else:
         should_offer = False
-    final_status = "pending" if should_offer else "searching"
+    final_status = "pending" 
     print(f"RIDE CREATE: {payload.vehicle_type} trip={final_trip} has_offer={has_offer} has_offer_pool={has_offer_pool} -> status={final_status}")
     correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
     max_seats = int(vehicle_row.get("max_pool_seats") or 3)
