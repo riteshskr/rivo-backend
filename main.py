@@ -1,7 +1,7 @@
 import os, json, time, jwt, uuid, math, httpx, asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -10,7 +10,7 @@ import firebase_admin
 from firebase_admin import credentials, messaging
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 22.0 With Driver Photo")
+app = FastAPI(title="Rivo Taxi API - Final 23.0 Optimized (All Features Same)")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -21,6 +21,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "rivo_jaipur_2026_default")
 
 try:
     fj = os.getenv("FIREBASE_CREDENTIALS_JSON")
@@ -30,6 +31,8 @@ try:
         print("Firebase OK")
 except Exception as e:
     print(f"Firebase Error: {e}")
+
+# --- HELPERS (Optimized but Same Feature) ---
 
 def haversine(lat1, lon1, lat2, lon2):
     try:
@@ -102,14 +105,13 @@ def is_point_along_route(curr_lat, curr_lng, drop_lat, drop_lng, new_lat, new_ln
     except:
         return False, 999
 
+# OPTIMIZED: Single Query se driver data lana
 def enrich_ride_with_driver(ride: dict):
     driver_id = ride.get("driver_id")
     if not driver_id:
         return ride
     try:
-        d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,current_latitude,current_longitude").eq("id", driver_id).execute()
-        if not d_res.data:
-            d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,current_latitude,current_longitude").eq("driver_id", driver_id).execute()
+        d_res = supabase.table("drivers").select("name,phone,vehicle_number,vehicle_type,photo_url,current_latitude,current_longitude,stringee_user_id").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
         if d_res.data:
             d = d_res.data[0]
             ride["driver_name"] = d.get("name") or ride.get("driver_name")
@@ -125,6 +127,32 @@ def enrich_ride_with_driver(ride: dict):
     except Exception as e:
         print(f"enrich error {e}")
     return ride
+
+# OPTIMIZED: Offers ke liye batch fetch
+def enrich_offers_with_photos(offers: list):
+    if not offers:
+        return offers
+    try:
+        driver_ids = list(set([o.get("driver_id") for o in offers if o.get("driver_id")]))
+        if not driver_ids:
+            return offers
+        d_res = supabase.table("drivers").select("id,driver_id,photo_url,vehicle_number,name").in_("id", driver_ids).execute()
+        d_res2 = supabase.table("drivers").select("id,driver_id,photo_url,vehicle_number,name").in_("driver_id", driver_ids).execute()
+        all_d = (d_res.data or []) + (d_res2.data or [])
+        d_map = {}
+        for d in all_d:
+            d_map[d.get("id")] = d
+            d_map[d.get("driver_id")] = d
+        for offer in offers:
+            d = d_map.get(offer.get("driver_id"))
+            if d:
+                offer["driver_photo"] = d.get("photo_url")
+                offer["photo_url"] = d.get("photo_url")
+                offer["vehicle_number"] = offer.get("vehicle_number") or d.get("vehicle_number")
+                offer["driver_name"] = d.get("name") or offer.get("driver_name")
+    except Exception as e:
+        print(f"enrich offers error {e}")
+    return offers
 
 class ConnectionManager:
     def __init__(self):
@@ -142,14 +170,14 @@ class ConnectionManager:
         if ride_id in self.active_connections:
             for c in list(self.active_connections[ride_id]):
                 try:
-                    await c.send_text(json.dumps(msg))
+                    await c.send_text(json.dumps(msg, default=str))
                 except:
                     pass
     async def broadcast_new_offer(self, ride_id: int, offers: list):
         if ride_id in self.active_connections:
             for c in list(self.active_connections[ride_id]):
                 try:
-                    await c.send_text(json.dumps({"type":"new_driver_offer","ride_id":ride_id,"offers":offers}))
+                    await c.send_text(json.dumps({"type":"new_driver_offer","ride_id":ride_id,"offers":offers}, default=str))
                 except:
                     pass
     async def connect_driver(self, ws: WebSocket, vehicle_type: str = "", lat: float = None, lng: float = None, driver_range: float = None, driver_id: str = ""):
@@ -164,6 +192,8 @@ class ConnectionManager:
         req_type = str(ride_data.get('vehicle_type','')).lower().strip()
         p_lat = float(ride_data.get('pickup_lat', 0))
         p_lng = float(ride_data.get('pickup_lng', 0))
+        # FIX: OTP ko broadcast se hataya
+        safe_ride = {k: v for k, v in ride_data.items() if k != 'otp'}
         dead = []
         for driver in list(self.driver_connections):
             ws = driver["ws"]
@@ -178,7 +208,7 @@ class ConnectionManager:
                 if not is_within_range(drange, dist):
                     continue
             try:
-                await ws.send_text(json.dumps({"type":"new_ride_alert","ride":ride_data}))
+                await ws.send_text(json.dumps({"type":"new_ride_alert","ride":safe_ride}, default=str))
             except:
                 dead.append(driver)
         for d in dead:
@@ -417,7 +447,7 @@ async def auto_timeout_checker():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("Rivo API 22.0 With Driver Photo OK")
+    print("Rivo API 23.0 Optimized OK - All Features Same")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -427,7 +457,7 @@ async def check_timeout_now():
 
 @app.get("/")
 def root():
-    return {"status":"Rivo API 22.0 With Driver Photo OK"}
+    return {"status":"Rivo API 23.0 Optimized - All Features Same OK"}
 
 @app.put("/rides/{ride_id}/offer")
 async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
@@ -452,20 +482,7 @@ async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
     }
     supabase.table("driver_offers").upsert(offer_data, on_conflict="ride_id,driver_id").execute()
     offers_res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute()
-    offers = offers_res.data or []
-    for offer in offers:
-        try:
-            d_id = offer.get("driver_id")
-            d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("id", d_id).execute()
-            if not d_res.data:
-                d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("driver_id", d_id).execute()
-            if d_res.data:
-                offer["driver_photo"] = d_res.data[0].get("photo_url")
-                offer["photo_url"] = d_res.data[0].get("photo_url")
-                offer["vehicle_number"] = offer.get("vehicle_number") or d_res.data[0].get("vehicle_number")
-                offer["driver_name"] = d_res.data[0].get("name") or offer.get("driver_name")
-        except:
-            pass
+    offers = enrich_offers_with_photos(offers_res.data or [])
     await manager.broadcast_new_offer(ride_id, offers)
     await manager.broadcast(ride_id, {"type":"new_driver_offer","ride_id":ride_id,"offers":offers})
     return {"success": True, "offers": offers, "count": len(offers)}
@@ -473,27 +490,12 @@ async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
 @app.get("/rides/{ride_id}/offers")
 def get_ride_offers(ride_id: int):
     res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).limit(50).execute()
-    offers = res.data or []
-    for offer in offers:
-        try:
-            d_id = offer.get("driver_id")
-            d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("id", d_id).execute()
-            if not d_res.data:
-                d_res = supabase.table("drivers").select("photo_url,vehicle_number,vehicle_type,name").eq("driver_id", d_id).execute()
-            if d_res.data:
-                offer["driver_photo"] = d_res.data[0].get("photo_url")
-                offer["photo_url"] = d_res.data[0].get("photo_url")
-                offer["vehicle_number"] = d_res.data[0].get("vehicle_number")
-                offer["driver_name"] = d_res.data[0].get("name") or offer.get("driver_name")
-        except:
-            pass
+    offers = enrich_offers_with_photos(res.data or [])
     return {"ride_id": ride_id, "offers": offers, "count": len(offers)}
 
 @app.put("/rides/{ride_id}/accept-offer")
 async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token,photo_url,stringee_user_id").eq("id", payload.driver_id).execute()
-    if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token,photo_url,stringee_user_id").eq("driver_id", payload.driver_id).execute()
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,fcm_token,photo_url,stringee_user_id").or_(f"id.eq.{payload.driver_id},driver_id.eq.{payload.driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
@@ -523,7 +525,7 @@ async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
                     "ride": ride_data,
                     "offered_fare": float(payload.offered_fare),
                     "expires_in": 120
-                }))
+                }, default=str))
             except:
                 pass
     try:
@@ -590,18 +592,7 @@ async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
     }).eq("id", ride_id).eq("status","rider_accepted").eq("driver_id", driver_id).execute()
     supabase.table("driver_offers").delete().eq("ride_id", ride_id).eq("driver_id", driver_id).execute()
     remaining_res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute()
-    remaining_offers = remaining_res.data or []
-    for offer in remaining_offers:
-        try:
-            d_id = offer.get("driver_id")
-            d_res = supabase.table("drivers").select("photo_url,vehicle_number,name").eq("id", d_id).execute()
-            if not d_res.data:
-                d_res = supabase.table("drivers").select("photo_url,vehicle_number,name").eq("driver_id", d_id).execute()
-            if d_res.data:
-                offer["driver_photo"] = d_res.data[0].get("photo_url")
-                offer["photo_url"] = d_res.data[0].get("photo_url")
-        except:
-            pass
+    remaining_offers = enrich_offers_with_photos(remaining_res.data or [])
     await manager.broadcast(ride_id, {
         "type": "driver_rejected",
         "ride_id": ride_id,
@@ -730,7 +721,7 @@ def driver_login(payload: DriverLoginRequest):
     if not res.data:
         res = supabase.table("drivers").select("*").ilike("driver_id", driver_input).limit(1).execute()
     if not res.data:
-        res = supabase.table("drivers").select("*").eq("phone", driver_input).limit(1).execute()
+        res = supabase.table("drivers").select("*").eq("phone", driver_input).execute()
     if not res.data:
         raise HTTPException(404, "Driver not found")
     driver = res.data[0]
@@ -766,9 +757,7 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
     lng = payload.longitude if payload.longitude is not None else payload.lng
     if lat is None or lng is None:
         raise HTTPException(400, "lat/lng required")
-    d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("id", driver_id).execute()
-    if not d_res.data:
-        d_res = supabase.table("drivers").select("id,range,vehicle_type").eq("driver_id", driver_id).execute()
+    d_res = supabase.table("drivers").select("id").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     real_id = d_res.data[0]["id"]
@@ -779,9 +768,7 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
-    d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("id", driver_id).execute()
-    if not d_res.data:
-        d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").eq("driver_id", driver_id).execute()
+    d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     drv = d_res.data[0]
@@ -936,9 +923,7 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
 
 @app.put("/rides/{ride_id}/accept")
 async def accept_ride(ride_id: int, driver_id: str=Query(...)):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("id",driver_id).execute()
-    if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("driver_id",driver_id).execute()
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
@@ -966,9 +951,7 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
 
 @app.put("/rides/{ride_id}/accept-pool")
 def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id: str = Query(...)):
-    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("id",driver_id).execute()
-    if not d_res.data:
-        d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").eq("driver_id",driver_id).execute()
+    d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     driver = d_res.data[0]
@@ -1078,7 +1061,7 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
-    res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
+    res = supabase.table("rides").select("*").or_(f"driver_id.eq.{driver_id}").in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
     if res.data:
         enriched = [enrich_ride_with_driver(r) for r in res.data]
         for r in enriched:
@@ -1092,9 +1075,7 @@ async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = 
     drange = None
     if driver_id:
         try:
-            d_res = supabase.table("drivers").select("range, vehicle_type").eq("id", driver_id).execute()
-            if not d_res.data:
-                d_res = supabase.table("drivers").select("range, vehicle_type").eq("driver_id", driver_id).execute()
+            d_res = supabase.table("drivers").select("range, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
             if d_res.data:
                 drange = get_range_by_vehicle(d_res.data[0].get("vehicle_type"), d_res.data[0].get("range"))
                 if not vehicle_type:
@@ -1134,9 +1115,7 @@ def get_driver_location_for_ride(ride_id: int):
         driver_id = ride_res.data[0].get("driver_id")
         if not driver_id:
             return {"lat": None, "lng": None, "current_latitude": None, "current_longitude": None}
-        d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen,photo_url").eq("id", driver_id).execute()
-        if not d_res.data:
-            d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen,photo_url").eq("driver_id", driver_id).execute()
+        d_res = supabase.table("drivers").select("id,current_latitude,current_longitude,last_seen,photo_url").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
         if not d_res.data:
             raise HTTPException(404, "Driver not found")
         d = d_res.data[0]
@@ -1174,9 +1153,7 @@ def get_ride_with_driver_location(ride_id: int):
     driver_id = ride.get("driver_id")
     if driver_id:
         try:
-            d_res = supabase.table("drivers").select("current_latitude,current_longitude").eq("id", driver_id).execute()
-            if not d_res.data:
-                d_res = supabase.table("drivers").select("current_latitude,current_longitude").eq("driver_id", driver_id).execute()
+            d_res = supabase.table("drivers").select("current_latitude,current_longitude").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
             if d_res.data:
                 d = d_res.data[0]
                 ride["driver_current_latitude"] = d.get("current_latitude")
@@ -1217,9 +1194,7 @@ def create_driver_admin(payload: dict):
 def update_driver_admin(driver_id: str, payload: dict):
     try:
         payload.pop("id", None)
-        res = supabase.table("drivers").update(payload).eq("id", driver_id).execute()
-        if not res.data:
-            res = supabase.table("drivers").update(payload).eq("driver_id", driver_id).execute()
+        res = supabase.table("drivers").update(payload).or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").execute()
         return res.data or {"success": True}
     except Exception as e:
         raise HTTPException(400, str(e))
@@ -1229,9 +1204,7 @@ def pause_driver_admin(driver_id: str, payload: dict):
     try:
         is_active = payload.get("is_active", True)
         update_data = {"is_active": is_active, "is_online": is_active}
-        res = supabase.table("drivers").update(update_data).eq("id", driver_id).execute()
-        if not res.data:
-            res = supabase.table("drivers").update(update_data).eq("driver_id", driver_id).execute()
+        res = supabase.table("drivers").update(update_data).or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").execute()
         if not is_active:
             manager.driver_connections = [d for d in manager.driver_connections if d.get("driver_id") != driver_id]
         return {"success": True, "is_active": is_active}
@@ -1241,8 +1214,7 @@ def pause_driver_admin(driver_id: str, payload: dict):
 @app.delete("/admin/drivers/{driver_id}")
 def delete_driver_admin(driver_id: str):
     try:
-        supabase.table("drivers").delete().eq("id", driver_id).execute()
-        supabase.table("drivers").delete().eq("driver_id", driver_id).execute()
+        supabase.table("drivers").delete().or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").execute()
         return {"success": True}
     except Exception as e:
         raise HTTPException(400, str(e))
