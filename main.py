@@ -621,11 +621,34 @@ async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
     return {"success": True, "message": "Rejected, Ride वापस Pending में", "offers": remaining_offers}
 
 # ========== EXISTING APIS ==========
+class CompleteRideRequest(BaseModel):
+    total_km_driven: Optional[float] = 0
+    actual_km: Optional[float] = 0
+    actual_distance: Optional[float] = 0
 @app.put("/rides/{ride_id}/complete")
-def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
-    supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat(), "passenger_status": "dropped"}).eq("id",ride_id).execute()
-    background_tasks.add_task(archive_and_delete_ride, ride_id)
-    return {"success":True}
+def complete_ride(ride_id: int, payload: CompleteRideRequest, background_tasks: BackgroundTasks):
+    try:
+        final_km = payload.total_km_driven or payload.actual_km or payload.actual_distance or 0
+
+        update_data = {
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "passenger_status": "dropped",
+            "total_km_driven": float(final_km)
+        }
+
+        supabase.table("rides").update(update_data).eq("id", ride_id).execute()
+        print(f"✅ Ride {ride_id} Completed - total_km_driven: {final_km} KM")
+
+        background_tasks.add_task(archive_and_delete_ride, ride_id)
+        return {"success": True, "total_km_driven": final_km}
+    except Exception as e:
+        print(f"Complete Error {e}")
+        supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id",ride_id).execute()
+        background_tasks.add_task(archive_and_delete_ride, ride_id)
+        return {"success": True}
+
+
 
 @app.put("/rides/{ride_id}/drop-complete")
 def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
@@ -801,7 +824,7 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
 @app.get("/vehicles")
 def get_vehicles():
     try:
-        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, pool_per_km, pool_night_per_km, pool_min_fare, pool_parcel_per_km, pool_parcel_per_km_night, pool_parcel_min_fare, max_pool_seats, icon_path").order("id", desc=False).execute()
+        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, pool_per_km, pool_night_per_km, pool_min_fare, pool_parcel_per_km, pool_parcel_per_km_night, has_pool, has_offer, has_offer_pool, pool_parcel_min_fare, max_pool_seats, icon_path").order("id", desc=False).execute()
         return res.data or []
     except Exception as e:
         print(f"Error fetching vehicles: {e}")
