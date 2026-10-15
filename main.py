@@ -102,7 +102,6 @@ def is_point_along_route(curr_lat, curr_lng, drop_lat, drop_lng, new_lat, new_ln
     except:
         return False, 999
 
-# ===== DRIVER PHOTO ENRICH FUNCTION - NAYA =====
 def enrich_ride_with_driver(ride: dict):
     driver_id = ride.get("driver_id")
     if not driver_id:
@@ -348,7 +347,7 @@ async def auto_timeout_checker():
     while True:
         try:
             now = datetime.now(timezone.utc)
-            pending_res = supabase.table("rides").select("id,created_at,scheduled_time,status").eq("status", "pending").limit(100).execute()
+            pending_res = supabase.table("rides").select("id,created_at,scheduled_time,status").in_("status", ["pending","searching"]).limit(100).execute()
             for r in pending_res.data or []:
                 ride_id = r['id']
                 created_at_str = r.get('created_at')
@@ -423,21 +422,21 @@ async def startup_event():
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
     now = datetime.now(timezone.utc)
-    pending = supabase.table("rides").select("id,created_at,scheduled_time,seats_booked,total_seats,pool_group_id,status").in_("status", ["pending","rider_accepted"]).execute().data or []
+    pending = supabase.table("rides").select("id,created_at,scheduled_time,seats_booked,total_seats,pool_group_id,status").in_("status", ["pending","rider_accepted","searching"]).execute().data or []
     return {"now_utc": now.isoformat(), "pending_count": len(pending), "rides": pending}
 
 @app.get("/")
 def root():
     return {"status":"Rivo API 22.0 With Driver Photo OK"}
 
-# ========== BIDDING SYSTEM ==========
 @app.put("/rides/{ride_id}/offer")
 async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
     r_res = supabase.table("rides").select("id,status").eq("id", ride_id).execute()
     if not r_res.data:
         raise HTTPException(404, "Ride नहीं मिली")
-    if r_res.data[0].get("status")!= "pending":
-        raise HTTPException(400, "Ride pending में नहीं है")
+    ride = r_res.data[0]
+    if ride.get("status")!= "pending":
+        raise HTTPException(400, "Direct Ride है - Offer नहीं, Direct Accept करो")
     busy = supabase.table("rides").select("id").eq("driver_id", payload.driver_id).in_("status", ["accepted","started","arrived","rider_accepted"]).limit(1).execute()
     if busy.data:
         same = supabase.table("rides").select("id").eq("id", ride_id).eq("driver_id", payload.driver_id).execute()
@@ -454,7 +453,6 @@ async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
     supabase.table("driver_offers").upsert(offer_data, on_conflict="ride_id,driver_id").execute()
     offers_res = supabase.table("driver_offers").select("*").eq("ride_id", ride_id).eq("status","pending").order("offered_fare", desc=False).execute()
     offers = offers_res.data or []
-    # enrich offers with photo
     for offer in offers:
         try:
             d_id = offer.get("driver_id")
@@ -620,26 +618,23 @@ async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
         print(f"broadcast new ride error {e}")
     return {"success": True, "message": "Rejected, Ride वापस Pending में", "offers": remaining_offers}
 
-# ========== EXISTING APIS ==========
 class CompleteRideRequest(BaseModel):
     total_km_driven: Optional[float] = 0
     actual_km: Optional[float] = 0
     actual_distance: Optional[float] = 0
+
 @app.put("/rides/{ride_id}/complete")
 def complete_ride(ride_id: int, payload: CompleteRideRequest, background_tasks: BackgroundTasks):
     try:
         final_km = payload.total_km_driven or payload.actual_km or payload.actual_distance or 0
-
         update_data = {
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "passenger_status": "dropped",
             "total_km_driven": float(final_km)
         }
-
         supabase.table("rides").update(update_data).eq("id", ride_id).execute()
         print(f"✅ Ride {ride_id} Completed - total_km_driven: {final_km} KM")
-
         background_tasks.add_task(archive_and_delete_ride, ride_id)
         return {"success": True, "total_km_driven": final_km}
     except Exception as e:
@@ -647,8 +642,6 @@ def complete_ride(ride_id: int, payload: CompleteRideRequest, background_tasks: 
         supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id",ride_id).execute()
         background_tasks.add_task(archive_and_delete_ride, ride_id)
         return {"success": True}
-
-
 
 @app.put("/rides/{ride_id}/drop-complete")
 def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
@@ -677,7 +670,7 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
 
 @app.get("/rides/pool/group/{group_id}/driver/{driver_id}")
 def get_my_pooled_rides(group_id: str, driver_id: str):
-    res = supabase.table("rides").select("*").eq("pool_group_id", group_id).eq("driver_id", driver_id).in_("status", ["accepted","started","arrived","pending","rider_accepted"]).order("id", desc=False).execute()
+    res = supabase.table("rides").select("*").eq("pool_group_id", group_id).eq("driver_id", driver_id).in_("status", ["accepted","started","arrived","pending","rider_accepted","searching"]).order("id", desc=False).execute()
     rides = res.data or []
     active = rides
     booked = sum([int(r.get("seats_booked") or 1) for r in active])
@@ -796,7 +789,7 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
     d_lng = driver_lng if driver_lng is not None else drv.get("current_longitude")
     d_vehicle = (vehicle_type or drv.get("vehicle_type") or "").strip()
     driver_range = get_range_by_vehicle(d_vehicle, drv.get("range"))
-    q = supabase.table("rides").select("*").eq("status","pending").order("id", desc=True).limit(50)
+    q = supabase.table("rides").select("*").in_("status",["pending","searching"]).order("id", desc=True).limit(50)
     if d_vehicle:
         q = q.eq("vehicle_type", d_vehicle)
     rides = q.execute().data or []
@@ -839,7 +832,7 @@ def get_ride(ride_id: int):
 
 @app.get("/rides/ongoing/{user_id}")
 def get_ongoing(user_id: str):
-    res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","accepted","started","arrived","rider_accepted"]).order("id", desc=True).limit(1).execute()
+    res = supabase.table("rides").select("*").eq("user_id", user_id).in_("status", ["pending","searching","accepted","started","arrived","rider_accepted"]).order("id", desc=True).limit(1).execute()
     if not res.data:
         return None
     return enrich_ride_with_driver(res.data[0])
@@ -850,46 +843,58 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     final_trip = "parcel" if "parcel" in payload.trip_type.lower() else "pool" if "pool" in payload.trip_type.lower() else "ride"
     raw_type = payload.trip_type.lower()
     if "pool_parcel" in raw_type or "pool parcel" in raw_type:
-        final_trip = "pool_parcel" # Parcel + Pool
+        final_trip = "pool_parcel"
     elif "parcel" in raw_type:
-        final_trip = "parcel" # Parcel Single
+        final_trip = "parcel"
     elif "pool" in raw_type:
-        final_trip = "pool" # Ride Pool
+        final_trip = "pool"
     else:
-        final_trip = "ride" # Ride 
+        final_trip = "ride"
     v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).limit(1).execute()
     if not v_res.data:
-
         v_res = supabase.table("vehicles").select("*").limit(1).execute()
     vehicle_row = v_res.data[0] if v_res.data else {}
+    def to_bool(v):
+        if v is True or v == 1:
+            return True
+        if isinstance(v, str) and v.lower() == 'true':
+            return True
+        return False
+    has_offer = to_bool(vehicle_row.get("has_offer"))
+    has_offer_pool = to_bool(vehicle_row.get("has_offer_pool"))
+    should_offer = False
+    if final_trip == "ride":
+        should_offer = has_offer
+    elif final_trip == "pool":
+        should_offer = has_offer_pool
+    else:
+        should_offer = False
+    final_status = "pending" if should_offer else "searching"
+    print(f"RIDE CREATE: {payload.vehicle_type} trip={final_trip} has_offer={has_offer} has_offer_pool={has_offer_pool} -> status={final_status}")
     correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
     max_seats = int(vehicle_row.get("max_pool_seats") or 3)
     seats_needed = int(payload.seats or 1)
-    if seats_needed < 1:
-        seats_needed = 1
-    if seats_needed > max_seats:
-        seats_needed = max_seats
+    if seats_needed < 1: seats_needed = 1
+    if seats_needed > max_seats: seats_needed = max_seats
     pool_group_id = f"POOL_{uuid.uuid4().hex[:6].upper()}" if final_trip=="pool" else None
     if final_trip == "pool":
         try:
-            active_pools = supabase.table("rides").select("pool_group_id, pickup_lat, pickup_lng, drop_lat, drop_lng").eq("trip_type","pool").in_("status",["pending","accepted","started"]).eq("vehicle_type", payload.vehicle_type).limit(30).execute().data or []
+            active_pools = supabase.table("rides").select("pool_group_id, pickup_lat, pickup_lng, drop_lat, drop_lng").eq("trip_type","pool").in_("status",["pending","accepted","started","searching"]).eq("vehicle_type", payload.vehicle_type).limit(30).execute().data or []
             found_group = None
             for p in active_pools:
                 gid = p.get("pool_group_id")
-                if not gid:
-                    continue
+                if not gid: continue
                 try:
                     d_pick = haversine(payload.pickup_lat, payload.pickup_lng, float(p["pickup_lat"]), float(p["pickup_lng"]))
                     d_drop = haversine(payload.drop_lat, payload.drop_lng, float(p["drop_lat"]), float(p["drop_lng"]))
                     if d_pick <= 2.0 and d_drop <= 5.0:
-                        group_rides = supabase.table("rides").select("seats_booked").eq("pool_group_id", gid).in_("status",["pending","accepted","started"]).execute().data or []
+                        group_rides = supabase.table("rides").select("seats_booked").eq("pool_group_id", gid).in_("status",["pending","accepted","started","searching"]).execute().data or []
                         booked = sum([int(r.get("seats_booked") or 1) for r in group_rides])
                         left = max_seats - booked
                         if left >= seats_needed:
                             found_group = gid
                             break
-                except:
-                    continue
+                except: continue
             if found_group:
                 pool_group_id = found_group
         except Exception as e:
@@ -907,7 +912,7 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
         "distance": payload.distance,
         "fare": correct_fare,
         "trip_type": final_trip,
-        "status": "pending",
+        "status": final_status,
         "otp": payload.otp,
         "currency": "INR",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -948,7 +953,7 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
         "driver_stringee_token": driver_token,
         "driver_stringee_user_id": driver_clean_id
     }
-    updated = supabase.table("rides").update(ride_update).eq("id",ride_id).eq("status","pending").execute()
+    updated = supabase.table("rides").update(ride_update).eq("id",ride_id).in_("status",["pending","searching"]).execute()
     if not updated.data:
         raise HTTPException(409, "Already taken")
     try:
@@ -983,7 +988,7 @@ def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id:
         "accepted_at": datetime.now(timezone.utc).isoformat(),
         "driver_stringee_token": driver_token,
         "driver_stringee_user_id": driver_clean_id
-    }).eq("id", ride_id).eq("status","pending").execute()
+    }).eq("id", ride_id).in_("status",["pending","searching"]).execute()
     if not res.data:
         raise HTTPException(409, "Already taken or seat full")
     try:
@@ -1037,7 +1042,7 @@ def get_pool_rides_along_route(active_ride_id: int, driver_id: str = Query(...),
     seats_left = max_seats - booked
     if seats_left <= 0:
         return []
-    pending_res = supabase.table("rides").select("*").eq("trip_type","pool").eq("status","pending").eq("vehicle_type", active.get("vehicle_type")).limit(30).execute()
+    pending_res = supabase.table("rides").select("*").eq("trip_type","pool").in_("status",["pending","searching"]).eq("vehicle_type", active.get("vehicle_type")).limit(30).execute()
     along = []
     for r in pending_res.data or []:
         try:
@@ -1147,7 +1152,7 @@ def get_driver_location_for_ride(ride_id: int):
 @app.put("/rides/pool/group/{group_id}/complete")
 def complete_pool_group(group_id: str, driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
     try:
-        res = supabase.table("rides").select("id").eq("pool_group_id", group_id).in_("status", ["accepted","started","arrived","pending"]).execute()
+        res = supabase.table("rides").select("id").eq("pool_group_id", group_id).in_("status", ["accepted","started","arrived","pending","searching"]).execute()
         rides = res.data or []
         if not rides:
             return {"success": True, "message": "Already completed"}
@@ -1296,6 +1301,7 @@ def get_all_rides_admin(status: str = Query(None), limit: int = Query(100)):
 def get_admin_stats():
     try:
         pending = supabase.table("rides").select("id", count="exact").eq("status", "pending").execute()
+        searching = supabase.table("rides").select("id", count="exact").eq("status", "searching").execute()
         accepted = supabase.table("rides").select("id", count="exact").in_("status", ["accepted","started","rider_accepted"]).execute()
         drivers = supabase.table("drivers").select("id", count="exact").execute()
         active_drivers = supabase.table("drivers").select("id", count="exact").eq("is_active", True).execute()
@@ -1303,6 +1309,7 @@ def get_admin_stats():
         archived = supabase.table("rides_archive").select("id", count="exact").execute()
         return {
             "pending_rides": pending.count or 0,
+            "searching_rides": searching.count or 0,
             "active_rides": accepted.count or 0,
             "total_drivers": drivers.count or 0,
             "active_drivers": active_drivers.count or 0,
