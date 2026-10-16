@@ -480,7 +480,7 @@ def get_rides_by_user(user_id: str = Query(...)):
 @app.get("/rides/advance/{user_id}")
 def get_advance_rides(user_id: str):
     try:
-        res = supabase.table("rides").select("*").eq("user_id", user_id).not_.is_("scheduled_time", "null").neq("scheduled_time", "").order("scheduled_time", desc=False).execute()
+        res = supabase.table("rides").select("*").eq("user_id", user_id).not_.is_("scheduled_time", "null").order("scheduled_time", desc=False).execute()
         rides = res.data or []
         enriched = [enrich_ride_with_driver(r) for r in rides]
         return {"rides": enriched, "count": len(enriched)}
