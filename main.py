@@ -458,6 +458,35 @@ async def check_timeout_now():
 @app.get("/")
 def root():
     return {"status":"Rivo API 23.0 Optimized - All Features Same OK"}
+@app.get("/rides")
+def get_rides_by_user(user_id: str = Query(...)):
+    try:
+        res = supabase.table("rides").select("*").eq("user_id", user_id).order("id", desc=True).limit(100).execute()
+        rides = res.data or []
+        try:
+            arch = supabase.table("rides_archive").select("*").eq("user_id", user_id).order("id", desc=True).limit(50).execute()
+            rides = rides + (arch.data or [])
+        except:
+            pass
+        enriched = []
+        for r in rides:
+            if r.get("driver_id"):
+                r = enrich_ride_with_driver(r)
+            enriched.append(r)
+        return {"rides": enriched, "count": len(enriched)}
+    except Exception as e:
+        print(f"get_rides error {e}")
+        raise HTTPException(500, str(e))
+@app.get("/rides/advance/{user_id}")
+def get_advance_rides(user_id: str):
+    try:
+        res = supabase.table("rides").select("*").eq("user_id", user_id).not_.is_("scheduled_time", "null").neq("scheduled_time", "").order("scheduled_time", desc=False).execute()
+        rides = res.data or []
+        enriched = [enrich_ride_with_driver(r) for r in rides]
+        return {"rides": enriched, "count": len(enriched)}
+    except Exception as e:
+        print(f"advance rides error {e}")
+        return {"rides": [], "count": 0}
 
 @app.put("/rides/{ride_id}/offer")
 async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
@@ -809,7 +838,6 @@ def get_vehicles():
     except Exception as e:
         print(f"Error fetching vehicles: {e}")
         return []
-
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
