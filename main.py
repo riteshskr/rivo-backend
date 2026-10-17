@@ -767,6 +767,32 @@ def driver_login(payload: DriverLoginRequest):
 
 @app.get("/maps/directions")
 async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)):
+    # origin = "26.9124,75.7873" (lat,lng)
+    # dest = "26.8500,75.8000" (lat,lng)
+    try:
+        # --- STEP 1: OSRM (FREE) TRY KARO ---
+        o_lat, o_lng = origin.split(',')
+        d_lat, d_lng = dest.split(',')
+        # OSRM को lng,lat चाहिए होता है, lat,lng नहीं
+        osrm_url = f"http://router.project-osrm.org/route/v1/driving/{o_lng.strip()},{o_lat.strip()};{d_lng.strip()},{d_lat.strip()}?overview=full&geometries=polyline"
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(osrm_url)
+            data = r.json()
+            if data.get("code") == "Ok" and data.get("routes"):
+                route = data["routes"][0]
+                # OSRM distance मीटर में देता है
+                dist_m = route["distance"]
+                dura_s = route["duration"]
+                return {
+                    "points": route["geometry"], # यही polyline है
+                    "distance_text": f"{dist_m/1000:.1f} km",
+                    "distance_value": int(dist_m),
+                    "duration_text": f"{int(dura_s/60)} mins",
+                    "source": "osrm" # चेक करने के लिए कि OSRM से आया
+                }
+    except Exception as e:
+        print(f"OSRM Fail: {e}, अब Google पर जा रहे हैं")
+    # --- STEP 2: अगर OSRM फेल हो गया तो ही Google (PAID) पर जाओ ---
     if not GOOGLE_MAPS_API_KEY:
         raise HTTPException(500, "GOOGLE_MAPS_API_KEY not set")
     url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={dest}&key={GOOGLE_MAPS_API_KEY}&language=en&overview=full"
@@ -776,9 +802,17 @@ async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)
         if data.get("status") == "OK":
             route = data["routes"][0]
             leg = route["legs"][0]
-            return {"points": route["overview_polyline"]["points"], "distance_text": leg["distance"]["text"], "distance_value": leg["distance"]["value"], "duration_text": leg["duration"]["text"]}
+            return {
+                "points": route["overview_polyline"]["points"], 
+                "distance_text": leg["distance"]["text"], 
+                "distance_value": leg["distance"]["value"], 
+                "duration_text": leg["duration"]["text"],
+                "source": "google"
+            }
         else:
             raise HTTPException(400, f"Google: {data.get('status')}")
+
+
 
 @app.put("/drivers/{driver_id}/location")
 async def update_driver_location(driver_id: str, payload: DriverLocationRequest):
