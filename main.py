@@ -292,6 +292,10 @@ class RideCreateRequest(BaseModel):
     trip_type: str="ride"
     otp: str
     seats: int = 1
+    rider_name: Optional[str] = None
+    rider_phone: Optional[str] = None
+    rider_id: Optional[str] = None
+    device_id: Optional[str] = None
 
 class DriverLoginRequest(BaseModel):
     driver_id: Optional[str]=None
@@ -974,6 +978,8 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
         "seats_booked": seats_needed,
         "total_seats": max_seats if final_trip=="pool" else 1,
         "max_pool_seats": max_seats if final_trip=="pool" else None,
+        "rider_name": payload.rider_name,
+        "rider_phone": payload.rider_phone,
     }
     res = supabase.table("rides").insert(ride_data).execute()
     if not res.data:
