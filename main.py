@@ -42,53 +42,59 @@ def translate_text_free(text: str, target_lang: str = "hi"):
     if not text or not str(text).strip():
         return text
     original_full = str(text).strip()
-    # 1. Plus Code हटाओ - जैसे H5C4+57G, ये Translate को रोकता है
-    # H5C4+57G, बजाज ग्राम -> बजाज ग्राम
     clean_text = re.sub(r'^[A-Z0-9]{4,}\+[A-Z0-9]{2,}[, ]*', '', original_full, flags=re.IGNORECASE).strip()
     if not clean_text:
         clean_text = original_full
+    # Target Language को Normalize करो - hi, en, gu, mr, pa, etc
+    target_lang = str(target_lang).strip().lower()[:2]
+    if target_lang not in ["hi","en","gu","mr","pa","bn","ta","te","kn","ml","ur"]:
+        target_lang = "en"  # अगर कोई नई Language है तो Default English
     is_hindi = contains_hindi(clean_text)
+    # अगर पहले से उसी Language में है तो Return
     if target_lang == "hi" and is_hindi:
         return original_full
     if target_lang == "en" and not is_hindi:
-        return original_full
-    print(f"TRANSLATING AS TEXT: {clean_text[:80]} | {('HI' if is_hindi else 'EN')}->{target_lang}")
-    # Trick: Text के आगे "Place name:" जोड़ दो ताकि Google इसे Address न समझे, Text समझे
-    text_to_translate = clean_text
-    # 2. MyMemory - सबसे पहले
+        # English में है और English ही चाहिए
+        # लेकिन Check करो क्या ये Hindi-English Mix है?
+        if not re.search(r'[\u0900-\u097F\u0A80-\u0AFF\u0900-\u0D7F]', clean_text):
+            return original_full
+    print(f"UNIVERSAL TRANSLATE: {clean_text[:50]} -> {target_lang}")
+    # 1. deep-translator - सभी Languages के लिए (100+ Languages)
+    try:
+        result = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
+        if result and result.strip() and result.lower() != clean_text.lower():
+            print(f"GoogleTranslator SUCCESS {target_lang}: {result[:50]}")
+            return result
+    except Exception as e:
+        print(f"GoogleTranslator Fail: {e}")
+    # 2. MyMemory - सभी Languages के लिए Backup
     try:
         src = "hi" if is_hindi else "en"
-        # Address को Text मानने के लिए Context जोड़ो
-        q = text_to_translate
-        r = httpx.get("https://api.mymemory.translated.net/get", params={"q": q, "langpair": f"{src}|{target_lang}"}, timeout=20)
+        r = httpx.get("https://api.mymemory.translated.net/get", 
+                     params={"q": clean_text, "langpair": f"{src}|{target_lang}"}, timeout=15)
         data = r.json()
         translated = data.get("responseData", {}).get("translatedText")
         if translated and translated.strip() and "MYMEMORY WARNING" not in translated and translated.lower() != clean_text.lower():
-            print(f"MyMemory SUCCESS: {translated}")
-            # अगर Plus Code था तो वापस जोड़ दो
-            if original_full != clean_text and target_lang == "en":
-                return translated  # English में Plus Code जरूरी नहीं
+            print(f"MyMemory SUCCESS {target_lang}: {translated[:50]}")
             return translated
     except Exception as e:
         print(f"MyMemory Fail: {e}")
-    # 3. GoogleTranslator - Second Try - इसे Text मान कर
+    # 3. Offline Transliteration - सिर्फ Indian Languages के लिए (बिना Internet के)
     try:
-        result = GoogleTranslator(source='auto', target=target_lang).translate(text_to_translate)
-        if result and result.strip() and result.lower() != clean_text.lower():
-            print(f"Google SUCCESS: {result}")
+        from indic_transliteration import sanscript
+        from indic_transliteration.sanscript import transliterate
+        if target_lang == "en" and is_hindi:
+            result = transliterate(clean_text, sanscript.DEVANAGARI, sanscript.ITRANS)
             return result
-    except Exception as e:
-        print(f"Google Fail: {e}")
-    # 4. Last Resort - अगर फिर भी नहीं हुआ तो Manual Hindi-English Dictionary
-    # बजाज ग्राम जैसे Common Words के लिए
-    if is_hindi and target_lang == "en":
-        # Common Replace
-        temp = clean_text.replace("बजाज ग्राम सांवली", "Bajaj Gram Sawali").replace("बजाज ग्राम", "Bajaj Gram").replace("गाँव", "Village").replace("सांवली", "Sawali")
-        if temp != clean_text:
-            print(f"Manual Dict: {temp}")
-            return temp
-    print("Translation failed, returning original")
+        elif target_lang == "hi" and not is_hindi:
+            result = transliterate(clean_text, sanscript.ITRANS, sanscript.DEVANAGARI)
+            return result
+    except:
+        pass
+    print("All translation failed, returning original")
     return original_full
+
+
 
 
 
