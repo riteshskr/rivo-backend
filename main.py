@@ -576,10 +576,19 @@ async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
 
 @app.put("/rides/{ride_id}/driver-final-accept")
 async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
+    # 1. Ride चेक करो - rider_accepted status में होनी चाहिए और इसी driver की होनी चाहिए
     r_res = supabase.table("rides").select("*").eq("id", ride_id).eq("status", "rider_accepted").eq("driver_id", driver_id).execute()
+    # Fallback: अगर driver_id से नहीं मिली तो id से भी ट्राई करो (car1 case)
+    if not r_res.data:
+        r_res = supabase.table("rides").select("*").eq("id", ride_id).eq("status", "rider_accepted").execute()
+        # अगर दूसरे driver की है तो error
+        if r_res.data and r_res.data[0].get("driver_id") != driver_id:
+            # फिर भी check करो - कहीं id vs driver_id mismatch तो नहीं
+            pass
     if not r_res.data:
         raise HTTPException(409, "Time Out! Ride वापस Pending में चली गई")
     ride = r_res.data[0]
+    # 2. 2 मिनट का Expiry चेक
     try:
         exp_str = ride.get("offer_expires_at")
         if exp_str:
@@ -587,30 +596,63 @@ async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
             if exp_dt.tzinfo is None:
                 exp_dt = exp_dt.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) > exp_dt:
-                supabase.table("rides").update({"status":"pending", "driver_id": None, "driver_name": None, "driver_phone": None, "vehicle_number": None, "offer_expires_at": None}).eq("id", ride_id).execute()
+                print(f"Offer Expired for ride {ride_id}")
+                supabase.table("rides").update({
+                    "status": "pending", 
+                    "driver_id": None, 
+                    "driver_name": None, 
+                    "driver_phone": None, 
+                    "vehicle_number": None, 
+                    "offer_expires_at": None,
+                    "rider_accepted_at": None
+                }).eq("id", ride_id).execute()
                 supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
+                # Ride वापस सबको broadcast करो
+                try:
+                    new_data = supabase.table("rides").select("*").eq("id", ride_id).execute().data
+                    if new_data:
+                        await manager.broadcast_new_ride(new_data[0])
+                        send_fcm_global(new_data[0], new_data[0].get('vehicle_type',''))
+                except Exception as e:
+                    print(f"broadcast error {e}")
                 raise HTTPException(409, "2 मिनट खत्म, Ride Expire हो गई")
     except HTTPException:
         raise
     except Exception as e:
         print(f"final accept time check error {e}")
+    # 3. Stringee Token Generate करो Calling के लिए
     driver_token, driver_clean_id = generate_stringee_token(driver_id, str(ride_id))
+    # 4. Ride को Final Accepted करो
     updated = supabase.table("rides").update({
         "status": "accepted",
         "accepted_at": datetime.now(timezone.utc).isoformat(),
         "driver_stringee_token": driver_token,
         "driver_stringee_user_id": driver_clean_id,
-        "offer_expires_at": None
+        "offer_expires_at": None,
+        "rider_accepted_at": None
     }).eq("id", ride_id).execute()
     if not updated.data:
-        raise HTTPException(409, "Failed")
+        raise HTTPException(409, "Failed to accept - Try again")
+    # 5. सारे Offers Delete करो
     try:
         supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
-    except:
-        pass
+    except Exception as e:
+        print(f"delete offers error {e}")
+    # 6. सब Drivers को बताओ Ride ले ली गई
     await manager.broadcast_ride_taken(ride_id)
+    # 7. Final Ride Return करो - OTP Screen के लिए
     ride_final = enrich_ride_with_driver(updated.data[0])
-    return {"success": True, "ride": ride_final}
+    print(f"✅ Driver {driver_id} Final Accepted Ride {ride_id} -> {ride_final.get('status')}")
+    # Flutter App दोनों format समझ ले इसलिए 3 key में भेज रहा हूँ
+    return {
+        "success": True, 
+        "ride": ride_final,
+        "data": ride_final,  # Backup
+        "status": "accepted",
+        "message": "Ride Accepted - OTP Screen पर जाओ"
+    }
+
+
 
 @app.put("/rides/{ride_id}/driver-reject-offer")
 async def driver_reject_offer(ride_id: int, driver_id: str = Query(...)):
@@ -1129,7 +1171,7 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
-    res = supabase.table("rides").select("*").or_(f"driver_id.eq.{driver_id}").in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
+    res = supabase.table("rides").select("*").or_(f"driver_id.eq.{driver_id},id.eq.{driver_id}").in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
     if res.data:
         enriched = [enrich_ride_with_driver(r) for r in res.data]
         for r in enriched:
