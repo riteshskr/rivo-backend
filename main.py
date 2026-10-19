@@ -855,7 +855,7 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
-    driver_lang = get_driver_language(driver_id) # drivers table se hi/en
+    driver_lang = get_driver_language(driver_id) # hi / en / gu
     d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
@@ -880,12 +880,17 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
             else:
                 dist = 0
             ride["distance_from_driver"] = round(dist, 2)
-            # --- FAST LOGIC - NO API CALL ---
+            # --- YAHI MAIN LOGIC HAI ---
             if driver_lang == "hi":
-                ride["pickup_address"] = ride.get("pickup_address_hi") or ride.get("pickup_address")
-                ride["drop_address"] = ride.get("drop_address_hi") or ride.get("drop_address")
+                # अगर पहले से hi save है तो वही दिखाओ, नहीं तो अभी translate करो
+                if ride.get("pickup_address_hi"):
+                    ride["pickup_address"] = ride["pickup_address_hi"]
+                    ride["drop_address"] = ride["drop_address_hi"] or ride["drop_address"]
+                else:
+                    # पहली बार ही वाला driver देख रहा है तो translate करो
+                    ride["pickup_address"] = translate_text(ride.get("pickup_address"), "hi")
+                    ride["drop_address"] = translate_text(ride.get("drop_address"), "hi")
             else:
-                # en, gu, etc. ke liye English dikhega
                 ride["pickup_address"] = ride.get("pickup_address")
                 ride["drop_address"] = ride.get("drop_address")
             ride["language"] = driver_lang
@@ -895,6 +900,8 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
             continue
     filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
     return filtered
+
+
 
 
 
