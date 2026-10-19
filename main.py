@@ -1,5 +1,4 @@
-
-import os, json, time, jwt, uuid, math, httpx, asyncio, re
+import os, json, time, jwt, uuid, math, httpx, asyncio, re, urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, BackgroundTasks
@@ -12,7 +11,7 @@ from firebase_admin import credentials, messaging
 from deep_translator import GoogleTranslator
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - V20 Final Fixed")
+app = FastAPI(title="Rivo Taxi API - V21 Direct Translate")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -53,22 +52,42 @@ def translate_text_free(text: str, target_lang: str = "hi"):
         return clean_text
     if target_lang == "en" and not is_hindi:
         return clean_text
-    print(f"TRANSLATE: '{clean_text[:60]}' -> {target_lang}")
+    
+    # 1. Direct Google API - NO LIMIT, works on Render
+    try:
+        q = urllib.parse.quote(clean_text)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={target_lang}&dt=t&q={q}"
+        r = httpx.get(url, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            translated = "".join([x[0] for x in data[0] if x[0]])
+            if translated and translated.strip() and translated.lower() != clean_text.lower():
+                print(f"GOOGLE DIRECT OK: {translated[:60]}")
+                return translated
+    except Exception as e:
+        print(f"Google Direct Fail: {e}")
+
+    # 2. deep_translator fallback
     try:
         result = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
         if result and result.strip():
+            print(f"GT OK: {result[:60]}")
             return result
     except Exception as e:
         print(f"GT Fail: {e}")
+
+    # 3. MyMemory fallback
     try:
         src = "hi" if is_hindi else "en"
-        r = httpx.get("https://api.mymemory.translated.net/get", params={"q": clean_text, "langpair": f"{src}|{target_lang}"}, timeout=10)
+        r = httpx.get("https://api.mymemory.translated.net/get", params={"q": clean_text, "langpair": f"{src}|{target_lang}"}, timeout=8)
         data = r.json()
         translated = data.get("responseData", {}).get("translatedText")
         if translated and translated.strip() and "MYMEMORY WARNING" not in translated:
+            print(f"MM OK: {translated[:60]}")
             return translated
     except Exception as e:
         print(f"MM Fail: {e}")
+    
     return clean_text
 
 def get_driver_language(driver_id: str):
@@ -394,7 +413,7 @@ async def auto_timeout_checker():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("Rivo API V20 Final Fixed OK")
+    print("Rivo API V21 Direct Translate OK")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -851,7 +870,7 @@ async def ws_ride(ws: WebSocket, ride_id: int):
 
 @app.get("/")
 def root():
-    return {"status":"Rivo API V20 Final Fixed OK"}
+    return {"status":"Rivo API V21 Direct Translate OK"}
 
 @app.get("/admin/archived")
 def get_archived():
