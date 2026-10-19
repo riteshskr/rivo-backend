@@ -7,3 +7,4 @@ websockets==13.1
 python-multipart==0.0.6
 pyjwt==2.8.0
 firebase-admin
+deep-translator==1.11.4
