@@ -12,7 +12,7 @@ from firebase_admin import credentials, messaging
 from deep_translator import GoogleTranslator
 
 load_dotenv()
-app = FastAPI(title="Rivo Taxi API - Final 19.1 + Translation + Login Fixed")
+app = FastAPI(title="Rivo Taxi API - V20 Final Fixed")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -33,7 +33,6 @@ try:
 except Exception as e:
     print(f"Firebase Error: {e}")
 
-# --- TRANSLATION HELPERS - UNIVERSAL - 100% FREE ---
 def contains_hindi(text: str):
     if not text: return False
     return bool(re.search(r'[\u0900-\u097F]', str(text)))
@@ -42,37 +41,35 @@ def translate_text_free(text: str, target_lang: str = "hi"):
     if not text or not str(text).strip():
         return text
     original_full = str(text).strip()
-    clean_text = re.sub(r'^[A-Z0-9]{4,}\+[A-Z0-9]{2,}[, ]*', '', original_full, flags=re.IGNORECASE).strip()
-    if not clean_text:
+    clean_text = re.sub(r'^[A-Z0-9]{3,}\+[A-Z0-9]{2,}[, ]*', '', original_full, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r'^[A-Z0-9]{4,}\+[A-Z0-9]{2,}[, ]*', '', clean_text, flags=re.IGNORECASE).strip()
+    if not clean_text or len(clean_text) < 2:
         clean_text = original_full
     target_lang = str(target_lang).strip().lower()[:2]
     if target_lang not in ["hi","en","gu","mr","pa","bn","ta","te","kn","ml","ur"]:
-        target_lang = "en"
+        target_lang = "hi"
     is_hindi = contains_hindi(clean_text)
     if target_lang == "hi" and is_hindi:
-        return original_full
+        return clean_text
     if target_lang == "en" and not is_hindi:
-        if not re.search(r'[\u0900-\u097F\u0A80-\u0AFF\u0900-\u0D7F]', clean_text):
-            return original_full
-    print(f"UNIVERSAL TRANSLATE: {clean_text[:50]} -> {target_lang}")
+        return clean_text
+    print(f"TRANSLATE: '{clean_text[:60]}' -> {target_lang}")
     try:
         result = GoogleTranslator(source='auto', target=target_lang).translate(clean_text)
-        if result and result.strip() and result.lower() != clean_text.lower():
-            print(f"GoogleTranslator SUCCESS {target_lang}: {result[:50]}")
+        if result and result.strip():
             return result
     except Exception as e:
-        print(f"GoogleTranslator Fail: {e}")
+        print(f"GT Fail: {e}")
     try:
         src = "hi" if is_hindi else "en"
-        r = httpx.get("https://api.mymemory.translated.net/get", params={"q": clean_text, "langpair": f"{src}|{target_lang}"}, timeout=15)
+        r = httpx.get("https://api.mymemory.translated.net/get", params={"q": clean_text, "langpair": f"{src}|{target_lang}"}, timeout=10)
         data = r.json()
         translated = data.get("responseData", {}).get("translatedText")
-        if translated and translated.strip() and "MYMEMORY WARNING" not in translated and translated.lower() != clean_text.lower():
-            print(f"MyMemory SUCCESS {target_lang}: {translated[:50]}")
+        if translated and translated.strip() and "MYMEMORY WARNING" not in translated:
             return translated
     except Exception as e:
-        print(f"MyMemory Fail: {e}")
-    return original_full
+        print(f"MM Fail: {e}")
+    return clean_text
 
 def get_driver_language(driver_id: str):
     try:
@@ -282,6 +279,11 @@ class RideCreateRequest(BaseModel):
     trip_type: str="ride"
     otp: str
     seats: int = 1
+    rider_name: Optional[str]=None
+    rider_phone: Optional[str]=None
+    rider_id: Optional[str]=None
+    device_id: Optional[str]=None
+    user_id: Optional[str]=None
 
 class DriverLoginRequest(BaseModel):
     driver_id: Optional[str]=None
@@ -392,7 +394,7 @@ async def auto_timeout_checker():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    print("Rivo API 19.1 + Translation OK")
+    print("Rivo API V20 Final Fixed OK")
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -410,7 +412,7 @@ def complete_ride(ride_id: int, background_tasks: BackgroundTasks):
 def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
     if not res.data:
-        raise HTTPException(404, "Ride नहीं मिली")
+        raise HTTPException(404, "Ride nahi mili")
     ride = res.data[0]
     gid = group_id or ride.get("pool_group_id")
     supabase.table("rides").update({"status": "completed","passenger_status": "dropped","completed_at": datetime.now(timezone.utc).isoformat(),}).eq("id", ride_id).execute()
@@ -490,12 +492,9 @@ def driver_login(payload: DriverLoginRequest):
     if not res.data:
         raise HTTPException(404, "Driver not found")
     driver = res.data[0]
-    # Password check - allow if no password in DB or matches or is 1234
     db_pass = str(driver.get('password','') or '').strip()
     if db_pass and db_pass != "" and db_pass != password_input:
         if password_input not in ["1234", "admin", "rivo123"]:
-            # Comment next line if you want to allow any password
-            # raise HTTPException(401, "Wrong password")
             print(f"Password mismatch but allowing: db={db_pass} input={password_input}")
     if payload.fcm_token:
         try:
@@ -567,7 +566,6 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
                 if driver_range is not None and dist > float(driver_range):
                     continue
             ride["distance_from_driver"] = round(dist, 2)
-            # Translation for driver's language
             orig_pickup = ride.get("pickup_address")
             orig_drop = ride.get("drop_address")
             ride["pickup_address"] = translate_text_free(orig_pickup, driver_lang)
@@ -646,6 +644,10 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
         correct_fare = correct_fare * seats_needed
     ride_data = {
         "user_id": user_id,
+        "rider_name": payload.rider_name or payload.user_id or user_id,
+        "rider_phone": payload.rider_phone,
+        "rider_id": payload.rider_id,
+        "device_id": payload.device_id,
         "pickup_lat": payload.pickup_lat,
         "pickup_lng": payload.pickup_lng,
         "drop_lat": payload.drop_lat,
@@ -849,7 +851,7 @@ async def ws_ride(ws: WebSocket, ride_id: int):
 
 @app.get("/")
 def root():
-    return {"status":"Rivo API 19.1 + Translation Fixed OK"}
+    return {"status":"Rivo API V20 Final Fixed OK"}
 
 @app.get("/admin/archived")
 def get_archived():
