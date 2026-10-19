@@ -32,7 +32,27 @@ try:
 except Exception as e:
     print(f"Firebase Error: {e}")
 
+
+from deep_translator import GoogleTranslator
+def translate_text(text: str, target_lang: str = "hi"):
+    if not text or not str(text).strip() or target_lang == "en":
+        return text
+    try:
+        return GoogleTranslator(source='auto', target=target_lang).translate(text)
+    except Exception as e:
+        print(f"Translation Fail {target_lang}: {e}")
+        return text
+def get_driver_language(driver_id: str):
+    try:
+        d_res = supabase.table("drivers").select("language").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+        if d_res.data and d_res.data[0].get("language"):
+            return str(d_res.data[0].get("language")).strip().lower()
+    except:
+        pass
+    return "en" # अगर language नहीं मिली तो default हिंदी
+
 # --- HELPERS (Optimized but Same Feature) ---
+
 
 def haversine(lat1, lon1, lat2, lon2):
     try:
@@ -835,6 +855,7 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
+    driver_lang = get_driver_language(driver_id) # drivers table se hi/en
     d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
@@ -847,26 +868,35 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
     if d_vehicle:
         q = q.eq("vehicle_type", d_vehicle)
     rides = q.execute().data or []
-    if d_lat is None or d_lng is None:
-        for r in rides:
-            r.pop("otp", None)
-        return rides
     filtered = []
     for ride in rides:
         try:
             p_lat = float(ride.get("pickup_lat", 0))
             p_lng = float(ride.get("pickup_lng", 0))
-            if p_lat==0 or p_lng==0:
-                continue
-            dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-            if driver_range is None or dist <= float(driver_range):
-                ride["distance_from_driver"] = round(dist, 2)
-                ride.pop("otp", None)
-                filtered.append(ride)
+            if p_lat==0 or p_lng==0: continue
+            if d_lat is not None and d_lng is not None:
+                dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
+                if driver_range is not None and dist > float(driver_range): continue
+            else:
+                dist = 0
+            ride["distance_from_driver"] = round(dist, 2)
+            # --- FAST LOGIC - NO API CALL ---
+            if driver_lang == "hi":
+                ride["pickup_address"] = ride.get("pickup_address_hi") or ride.get("pickup_address")
+                ride["drop_address"] = ride.get("drop_address_hi") or ride.get("drop_address")
+            else:
+                # en, gu, etc. ke liye English dikhega
+                ride["pickup_address"] = ride.get("pickup_address")
+                ride["drop_address"] = ride.get("drop_address")
+            ride["language"] = driver_lang
+            ride.pop("otp", None)
+            filtered.append(ride)
         except:
             continue
     filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
     return filtered
+
+
 
 @app.get("/vehicles")
 def get_vehicles():
@@ -908,22 +938,9 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
         v_res = supabase.table("vehicles").select("*").limit(1).execute()
     vehicle_row = v_res.data[0] if v_res.data else {}
     def to_bool(v):
-        if v is True or v == 1:
-            return True
-        if isinstance(v, str) and v.lower() == 'true':
-            return True
+        if v is True or v == 1: return True
+        if isinstance(v, str) and v.lower() == 'true': return True
         return False
-    has_offer = to_bool(vehicle_row.get("has_offer"))
-    has_offer_pool = to_bool(vehicle_row.get("has_offer_pool"))
-    should_offer = False
-    if final_trip == "ride":
-        should_offer = has_offer
-    elif final_trip == "pool":
-        should_offer = has_offer_pool
-    else:
-        should_offer = False
-    final_status = "pending" 
-    print(f"RIDE CREATE: {payload.vehicle_type} trip={final_trip} has_offer={has_offer} has_offer_pool={has_offer_pool} -> status={final_status}")
     correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
     max_seats = int(vehicle_row.get("max_pool_seats") or 3)
     seats_needed = int(payload.seats or 1)
@@ -931,41 +948,30 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     if seats_needed > max_seats: seats_needed = max_seats
     pool_group_id = f"POOL_{uuid.uuid4().hex[:6].upper()}" if final_trip=="pool" else None
     if final_trip == "pool":
-        try:
-            active_pools = supabase.table("rides").select("pool_group_id, pickup_lat, pickup_lng, drop_lat, drop_lng").eq("trip_type","pool").in_("status",["pending","accepted","started","searching"]).eq("vehicle_type", payload.vehicle_type).limit(30).execute().data or []
-            found_group = None
-            for p in active_pools:
-                gid = p.get("pool_group_id")
-                if not gid: continue
-                try:
-                    d_pick = haversine(payload.pickup_lat, payload.pickup_lng, float(p["pickup_lat"]), float(p["pickup_lng"]))
-                    d_drop = haversine(payload.drop_lat, payload.drop_lng, float(p["drop_lat"]), float(p["drop_lng"]))
-                    if d_pick <= 2.0 and d_drop <= 5.0:
-                        group_rides = supabase.table("rides").select("seats_booked").eq("pool_group_id", gid).in_("status",["pending","accepted","started","searching"]).execute().data or []
-                        booked = sum([int(r.get("seats_booked") or 1) for r in group_rides])
-                        left = max_seats - booked
-                        if left >= seats_needed:
-                            found_group = gid
-                            break
-                except: continue
-            if found_group:
-                pool_group_id = found_group
-        except Exception as e:
-            print(f"Pool seat check error {e}")
         correct_fare = correct_fare * seats_needed
+    # --- YAHI NAYA LOGIC HAI - EK BAAR TRANSLATE ---
+    # English Original aur Hindi dono save kar rahe hain
+    try:
+        pickup_hi = translate_text(payload.pickup_address, "hi")
+        drop_hi = translate_text(payload.drop_address, "hi")
+    except:
+        pickup_hi = payload.pickup_address
+        drop_hi = payload.drop_address
     ride_data = {
         "user_id": user_id,
         "pickup_lat": payload.pickup_lat,
         "pickup_lng": payload.pickup_lng,
         "drop_lat": payload.drop_lat,
         "drop_lng": payload.drop_lng,
-        "pickup_address": payload.pickup_address,
+        "pickup_address": payload.pickup_address, # English Original
         "drop_address": payload.drop_address,
+        "pickup_address_hi": pickup_hi, # Hindi Translated - Ek baar save
+        "drop_address_hi": drop_hi,
         "vehicle_type": payload.vehicle_type,
         "distance": payload.distance,
         "fare": correct_fare,
         "trip_type": final_trip,
-        "status": final_status,
+        "status": "pending",
         "otp": payload.otp,
         "currency": "INR",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -988,6 +994,8 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     await manager.broadcast_new_ride(new_ride)
     send_fcm_global(new_ride, payload.vehicle_type)
     return new_ride
+
+
 
 @app.put("/rides/{ride_id}/accept")
 async def accept_ride(ride_id: int, driver_id: str=Query(...)):
