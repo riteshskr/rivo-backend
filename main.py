@@ -8,10 +8,11 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, messaging
-from deep_translator import MyMemoryTranslator
+import translators as ts
 import re
 
 load_dotenv()
+os.environ['translators_region'] = 'US'
 app = FastAPI(title="Rivo Taxi API - Final 23.0 Optimized (All Features Same)")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
@@ -36,16 +37,36 @@ except Exception as e:
 
 # --- HELPERS (Optimized but Same Feature) ---
 # --- TRANSLATION HELPER (100% Free) ---
+
+def _has_hindi(text: str) -> bool:
+    return bool(text) and bool(re.search('[\u0900-\u097F]', text))
+
+def _try_translate(text: str, engine: str) -> str:
+    try:
+        result = ts.translate_text(
+            text,
+            translator=engine,
+            from_language='en',
+            to_language='hi'
+        )
+        if result and _has_hindi(result):
+            return result
+    except Exception as e:
+        print(f"[translate] {engine} failed: {e}")
+    return ""
+
 def to_hindi_free(text: str) -> str:
     if not text or not text.strip():
         return ""
-    if re.search('[\u0900-\u097F]', text): # पहले से हिंदी में है तो वैसे ही रहने दो
+    if _has_hindi(text):
         return text
-    try:
-        return MyMemoryTranslator(source='en-US', target='hi-IN').translate(text)
-    except Exception as e:
-        print(f"Translate Error: {e}")
-        return text
+    # Bing पहले, फिर Alibaba, अंत में Google
+    for engine in ('bing', 'alibaba', 'google'):
+        result = _try_translate(text, engine)
+        if result:
+            return result
+    print(f"[translate] all engines failed for: {text[:50]}")
+    return text
 
 
 
@@ -1009,9 +1030,9 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
     # HINDI TRANSLATION LOGIC
     final_pickup_hi = payload.pickup_address_hi
     final_drop_hi = payload.drop_address_hi
-    if not final_pickup_hi and payload.pickup_address:
+    if (not final_pickup_hi or not _has_hindi(final_pickup_hi)) and payload.pickup_address:
         final_pickup_hi = to_hindi_free(payload.pickup_address)
-    if not final_drop_hi and payload.drop_address:
+    if (not final_drop_hi or not _has_hindi(final_drop_hi)) and payload.drop_address:
         final_drop_hi = to_hindi_free(payload.drop_address)
     ride_data = {
         "user_id": user_id,
