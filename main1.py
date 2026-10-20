@@ -8,6 +8,8 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, messaging
+from deep_translator import MyMemoryTranslator
+import re
 
 load_dotenv()
 app = FastAPI(title="Rivo Taxi API - Final 23.0 Optimized (All Features Same)")
@@ -284,7 +286,9 @@ class RideCreateRequest(BaseModel):
     drop_lat: float
     drop_lng: float
     pickup_address: Optional[str]=None
+    pickup_address_hi: Optional[str]=None
     drop_address: Optional[str]=None
+    drop_address_hi: Optional[str]=None
     vehicle_type: str="Mini"
     distance: float
     fare: float
@@ -996,33 +1000,35 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
             print(f"Pool seat check error {e}")
         correct_fare = correct_fare * seats_needed
     ride_data = {
-        "user_id": user_id,
-        "pickup_lat": payload.pickup_lat,
-        "pickup_lng": payload.pickup_lng,
-        "drop_lat": payload.drop_lat,
-        "drop_lng": payload.drop_lng,
-        "pickup_address": payload.pickup_address,
-        "drop_address": payload.drop_address,
-        "vehicle_type": payload.vehicle_type,
-        "distance": payload.distance,
-        "fare": correct_fare,
-        "trip_type": final_trip,
-        "status": final_status,
-        "otp": payload.otp,
-        "currency": "INR",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "scheduled_time": payload.scheduled_time,
-        "stringee_token": token,
-        "stringee_user_id": clean_id,
-        "pool_group_id": pool_group_id,
-        "is_pool_ride": final_trip=="pool",
-        "passenger_status": "waiting",
-        "seats_booked": seats_needed,
-        "total_seats": max_seats if final_trip=="pool" else 1,
-        "max_pool_seats": max_seats if final_trip=="pool" else None,
-        "rider_name": payload.rider_name,
-        "rider_phone": payload.rider_phone,
-    }
+    "user_id": user_id,
+    "pickup_lat": payload.pickup_lat,
+    "pickup_lng": payload.pickup_lng,
+    "drop_lat": payload.drop_lat,
+    "drop_lng": payload.drop_lng,
+    "pickup_address": payload.pickup_address,
+    "pickup_address_hi": payload.pickup_address_hi,
+    "drop_address": payload.drop_address,
+    "drop_address_hi": payload.drop_address_hi,
+    "vehicle_type": payload.vehicle_type,
+    "distance": payload.distance,
+    "fare": correct_fare,
+    "trip_type": final_trip,
+    "status": final_status,
+    "otp": payload.otp,
+    "currency": "INR",
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "scheduled_time": payload.scheduled_time,
+    "stringee_token": token,
+    "stringee_user_id": clean_id,
+    "pool_group_id": pool_group_id,
+    "is_pool_ride": final_trip=="pool",
+    "passenger_status": "waiting",
+    "seats_booked": seats_needed,
+    "total_seats": max_seats if final_trip=="pool" else 1,
+    "max_pool_seats": max_seats if final_trip=="pool" else None,
+    "rider_name": payload.rider_name,
+    "rider_phone": payload.rider_phone,
+}
     res = supabase.table("rides").insert(ride_data).execute()
     if not res.data:
         raise HTTPException(500, "Failed")
