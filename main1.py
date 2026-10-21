@@ -12,6 +12,7 @@ from deep_translator import MyMemoryTranslator
 import re
 
 load_dotenv()
+
 app = FastAPI(title="Rivo Taxi API - Final 23.0 Optimized (All Features Same)")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
@@ -35,6 +36,23 @@ except Exception as e:
     print(f"Firebase Error: {e}")
 
 # --- HELPERS (Optimized but Same Feature) ---
+# --- TRANSLATION HELPER (100% Free) ---
+
+
+def to_hindi_free(text: str) -> str:
+    if not text or not text.strip():
+        return ""
+    if re.search('[\u0900-\u097F]', text):
+        return text
+    try:
+        result = MyMemoryTranslator(source='en-US', target='hi-IN').translate(text)
+        if result and re.search('[\u0900-\u097F]', result):
+            return result
+    except Exception as e:
+        print(f"Translate Error: {e}")
+    return text
+
+
 
 def haversine(lat1, lon1, lat2, lon2):
     try:
@@ -259,6 +277,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
                 tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
         if not tokens:
+            print("No tokens")
             return
         trip = str(ride_data.get('trip_type','ride')).lower()
         seats_info = ""
@@ -270,15 +289,44 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             title = f"POOL {vehicle_type}!{seats_info}"
         else:
             title = f"RIDE {vehicle_type}!"
-        body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | {ride_data.get('fare','')}"
-        android_notif = messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert', default_sound=False)
+        body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | ₹{ride_data.get('fare','')}"
+        # FIX 1: sound='alert' हटा दिया, default sound रखा - स्लीप में यही बजता है
+        android_notif = messaging.AndroidNotification(
+            channel_id='ride_channel_v5', 
+            priority='max', 
+            visibility='public',
+            # sound='alert' # <-- इसको हटा दो, फाइल नहीं है तो Notification ही नहीं आएगा
+        )
         android_config = messaging.AndroidConfig(priority='high', notification=android_notif)
-        apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1)))
+        apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1, content_available=True)))
         safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
-        msg = messaging.MulticastMessage(notification=messaging.Notification(title=title, body=body), data={'vehicle_type': v_type, 'trip_type': trip, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert', 'fare': str(ride_data.get('fare','')), 'click_action': 'FLUTTER_NOTIFICATION_CLICK', 'sound': 'alert', 'ride_json': json.dumps(safe_ride, default=str)}, tokens=tokens, android=android_config, apns=apns_config)
-        messaging.send_each_for_multicast(msg)
+        # FIX 2: Multicast की जगह एक-एक करके भेजो, एक Token खराब तो भी बाकी को जाएगा
+        for token in tokens:
+            msg = messaging.Message(
+                token=token,
+                notification=messaging.Notification(title=title, body=body),
+                data={
+                    'vehicle_type': v_type, 
+                    'trip_type': trip, 
+                    'ride_id': str(ride_data.get('id','')), 
+                    'type': 'new_ride_alert', 
+                    'fare': str(ride_data.get('fare','')), 
+                    'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+                    'ride_json': json.dumps(safe_ride, default=str)
+                },
+                android=android_config,
+                apns=apns_config
+            )
+            try:
+                messaging.send(msg)
+            except Exception as e:
+                print(f"FCM fail for token {token[:10]}... : {e}")
+                continue
+        print(f"FCM Alert sent to {len(tokens)} drivers")
     except Exception as e:
         print(f"FCM Error {e}")
+
+
 
 class RideCreateRequest(BaseModel):
     pickup_lat: float
@@ -937,9 +985,11 @@ def get_ongoing(user_id: str):
     return enrich_ride_with_driver(res.data[0])
 
 @app.post("/rides")
-async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
+async def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
+    # 1. Stringee टोकन जनरेट करें (राइडर कॉलिंग के लिए)
     token, clean_id = generate_stringee_token(user_id, "new")
-    final_trip = "parcel" if "parcel" in payload.trip_type.lower() else "pool" if "pool" in payload.trip_type.lower() else "ride"
+
+    # 2. यात्रा प्रकार का सामान्यीकरण
     raw_type = payload.trip_type.lower()
     if "pool_parcel" in raw_type or "pool parcel" in raw_type:
         final_trip = "pool_parcel"
@@ -949,93 +999,120 @@ async def create_ride(payload: RideCreateRequest, user_id: str=Query(...)):
         final_trip = "pool"
     else:
         final_trip = "ride"
+
+    # 3. वाहन जानकारी प्राप्त करें
     v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).limit(1).execute()
     if not v_res.data:
         v_res = supabase.table("vehicles").select("*").limit(1).execute()
     vehicle_row = v_res.data[0] if v_res.data else {}
+
     def to_bool(v):
         if v is True or v == 1:
             return True
         if isinstance(v, str) and v.lower() == 'true':
             return True
         return False
+
     has_offer = to_bool(vehicle_row.get("has_offer"))
     has_offer_pool = to_bool(vehicle_row.get("has_offer_pool"))
-    should_offer = False
-    if final_trip == "ride":
-        should_offer = has_offer
-    elif final_trip == "pool":
-        should_offer = has_offer_pool
-    else:
-        should_offer = False
-    final_status = "pending" 
-    print(f"RIDE CREATE: {payload.vehicle_type} trip={final_trip} has_offer={has_offer} has_offer_pool={has_offer_pool} -> status={final_status}")
+    final_status = "pending"
+    print(f"RIDE CREATE: {payload.vehicle_type} trip={final_trip} -> status={final_status}")
+
+    # 4. किराया गणना
     correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
+
+    # 5. सीट लॉजिक
     max_seats = int(vehicle_row.get("max_pool_seats") or 3)
     seats_needed = int(payload.seats or 1)
-    if seats_needed < 1: seats_needed = 1
-    if seats_needed > max_seats: seats_needed = max_seats
-    pool_group_id = f"POOL_{uuid.uuid4().hex[:6].upper()}" if final_trip=="pool" else None
+    if seats_needed < 1:
+        seats_needed = 1
+    if seats_needed > max_seats:
+        seats_needed = max_seats
+
+    pool_group_id = f"POOL_{uuid.uuid4().hex[:6].upper()}" if final_trip == "pool" else None
+
+    # 6. पूल ग्रुप लॉजिक (यदि पूल है, तो समान दिशा वाले ग्रुप में शामिल होने का प्रयास करें)
     if final_trip == "pool":
         try:
-            active_pools = supabase.table("rides").select("pool_group_id, pickup_lat, pickup_lng, drop_lat, drop_lng").eq("trip_type","pool").in_("status",["pending","accepted","started","searching"]).eq("vehicle_type", payload.vehicle_type).limit(30).execute().data or []
+            active_pools = supabase.table("rides").select("pool_group_id, pickup_lat, pickup_lng, drop_lat, drop_lng").eq("trip_type", "pool").in_("status", ["pending", "accepted", "started", "searching"]).eq("vehicle_type", payload.vehicle_type).limit(30).execute().data or []
             found_group = None
             for p in active_pools:
                 gid = p.get("pool_group_id")
-                if not gid: continue
+                if not gid:
+                    continue
                 try:
                     d_pick = haversine(payload.pickup_lat, payload.pickup_lng, float(p["pickup_lat"]), float(p["pickup_lng"]))
                     d_drop = haversine(payload.drop_lat, payload.drop_lng, float(p["drop_lat"]), float(p["drop_lng"]))
                     if d_pick <= 2.0 and d_drop <= 5.0:
-                        group_rides = supabase.table("rides").select("seats_booked").eq("pool_group_id", gid).in_("status",["pending","accepted","started","searching"]).execute().data or []
+                        group_rides = supabase.table("rides").select("seats_booked").eq("pool_group_id", gid).in_("status", ["pending", "accepted", "started", "searching"]).execute().data or []
                         booked = sum([int(r.get("seats_booked") or 1) for r in group_rides])
                         left = max_seats - booked
                         if left >= seats_needed:
                             found_group = gid
                             break
-                except: continue
+                except:
+                    continue
             if found_group:
                 pool_group_id = found_group
         except Exception as e:
             print(f"Pool seat check error {e}")
         correct_fare = correct_fare * seats_needed
+
+    # 7. हिंदी अनुवाद (यदि क्लाइंट ने हिंदी नहीं भेजी या अंग्रेजी भेजी है, तो सर्वर पर अनुवाद करें)
+    final_pickup_hi = payload.pickup_address_hi
+    final_drop_hi = payload.drop_address_hi
+    if (not final_pickup_hi or not re.search('[\u0900-\u097F]', final_pickup_hi)) and payload.pickup_address:
+        final_pickup_hi = to_hindi_free(payload.pickup_address)
+    if (not final_drop_hi or not re.search('[\u0900-\u097F]', final_drop_hi)) and payload.drop_address:
+        final_drop_hi = to_hindi_free(payload.drop_address)
+
+    # 8. राइड डेटा बनाएं
     ride_data = {
-    "user_id": user_id,
-    "pickup_lat": payload.pickup_lat,
-    "pickup_lng": payload.pickup_lng,
-    "drop_lat": payload.drop_lat,
-    "drop_lng": payload.drop_lng,
-    "pickup_address": payload.pickup_address,
-    "pickup_address_hi": payload.pickup_address_hi,
-    "drop_address": payload.drop_address,
-    "drop_address_hi": payload.drop_address_hi,
-    "vehicle_type": payload.vehicle_type,
-    "distance": payload.distance,
-    "fare": correct_fare,
-    "trip_type": final_trip,
-    "status": final_status,
-    "otp": payload.otp,
-    "currency": "INR",
-    "created_at": datetime.now(timezone.utc).isoformat(),
-    "scheduled_time": payload.scheduled_time,
-    "stringee_token": token,
-    "stringee_user_id": clean_id,
-    "pool_group_id": pool_group_id,
-    "is_pool_ride": final_trip=="pool",
-    "passenger_status": "waiting",
-    "seats_booked": seats_needed,
-    "total_seats": max_seats if final_trip=="pool" else 1,
-    "max_pool_seats": max_seats if final_trip=="pool" else None,
-    "rider_name": payload.rider_name,
-    "rider_phone": payload.rider_phone,
-}
+        "user_id": user_id,
+        "pickup_lat": payload.pickup_lat,
+        "pickup_lng": payload.pickup_lng,
+        "drop_lat": payload.drop_lat,
+        "drop_lng": payload.drop_lng,
+        "pickup_address": payload.pickup_address,
+        "drop_address": payload.drop_address,
+        "pickup_address_hi": final_pickup_hi,
+        "drop_address_hi": final_drop_hi,
+        "vehicle_type": payload.vehicle_type,
+        "distance": payload.distance,
+        "fare": correct_fare,
+        "trip_type": final_trip,
+        "status": final_status,
+        "otp": payload.otp,
+        "currency": "INR",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "scheduled_time": payload.scheduled_time,
+        "stringee_token": token,
+        "stringee_user_id": clean_id,
+        "pool_group_id": pool_group_id,
+        "is_pool_ride": final_trip == "pool",
+        "passenger_status": "waiting",
+        "seats_booked": seats_needed,
+        "total_seats": max_seats if final_trip == "pool" else 1,
+        "max_pool_seats": max_seats if final_trip == "pool" else None,
+        "rider_name": payload.rider_name,
+        "rider_phone": payload.rider_phone,
+    }
+
+    # 9. डेटाबेस में डालें
     res = supabase.table("rides").insert(ride_data).execute()
     if not res.data:
-        raise HTTPException(500, "Failed")
+        raise HTTPException(500, "Failed to create ride")
+
     new_ride = res.data[0]
+
+    # 10. ड्राइवरों को ब्रॉडकास्ट करें (WebSocket + FCM)
     await manager.broadcast_new_ride(new_ride)
     send_fcm_global(new_ride, payload.vehicle_type)
+
     return new_ride
+
+
+
 
 @app.put("/rides/{ride_id}/accept")
 async def accept_ride(ride_id: int, driver_id: str=Query(...)):

@@ -277,6 +277,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
                 tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
         if not tokens:
+            print("No tokens")
             return
         trip = str(ride_data.get('trip_type','ride')).lower()
         seats_info = ""
@@ -288,13 +289,39 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             title = f"POOL {vehicle_type}!{seats_info}"
         else:
             title = f"RIDE {vehicle_type}!"
-        body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | {ride_data.get('fare','')}"
-        android_notif = messaging.AndroidNotification(channel_id='ride_channel_v5', priority='max', visibility='public', sound='alert', default_sound=False)
+        body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | ₹{ride_data.get('fare','')}"
+        # FINAL FIX: Channel ID को ड्राइवर App के बराबर किया और sound='alert' हटाया
+        android_notif = messaging.AndroidNotification(
+            channel_id='ride_channel_v6_final',  # <-- आपके ड्राइवर App वाला ID
+            priority='max', 
+            visibility='public',
+        )
         android_config = messaging.AndroidConfig(priority='high', notification=android_notif)
-        apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1)))
+        apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1, content_available=True)))
         safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
-        msg = messaging.MulticastMessage(notification=messaging.Notification(title=title, body=body), data={'vehicle_type': v_type, 'trip_type': trip, 'ride_id': str(ride_data.get('id','')), 'type': 'new_ride_alert', 'fare': str(ride_data.get('fare','')), 'click_action': 'FLUTTER_NOTIFICATION_CLICK', 'sound': 'alert', 'ride_json': json.dumps(safe_ride, default=str)}, tokens=tokens, android=android_config, apns=apns_config)
-        messaging.send_each_for_multicast(msg)
+        # एक-एक Token पर भेजो ताकि एक खराब Token से सब Fail न हो
+        for token in tokens:
+            msg = messaging.Message(
+                token=token,
+                notification=messaging.Notification(title=title, body=body),
+                data={
+                    'vehicle_type': v_type, 
+                    'trip_type': trip, 
+                    'ride_id': str(ride_data.get('id','')), 
+                    'type': 'new_ride_alert', 
+                    'fare': str(ride_data.get('fare','')), 
+                    'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+                    'ride_json': json.dumps(safe_ride, default=str)
+                },
+                android=android_config,
+                apns=apns_config
+            )
+            try:
+                messaging.send(msg)
+            except Exception as e:
+                print(f"FCM fail {e}")
+                continue
+        print(f"FCM Alert sent to {len(tokens)} drivers - Channel v6_final")
     except Exception as e:
         print(f"FCM Error {e}")
 
