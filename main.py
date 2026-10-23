@@ -389,6 +389,59 @@ def generate_stringee_token(user_id: str, ride_id: str=""):
     token = jwt.encode(payload, STRINGEE_API_KEY_SECRET, algorithm="HS256", headers={"cty": "stringee-api;v=1"})
     return token, clean_id
 
+def send_rider_call_fcm(rider_user_id: str, driver_name: str, driver_id: str, ride_id: int):
+    try:
+        if not firebase_admin._apps:
+            print("Firebase not init")
+            return False
+        # Rider का FCM Token निकालो
+        rider_token = None
+        try:
+            r_res = supabase.table("rides").select("fcm_token, rider_fcm_token, stringee_token").eq("user_id", rider_user_id).order("id", desc=True).limit(1).execute()
+            if r_res.data:
+                row = r_res.data[0]
+                rider_token = row.get("fcm_token") or row.get("rider_fcm_token")
+                print(f"Found token from rides table: {rider_token[:20] if rider_token else 'None'}...")
+        except Exception as e:
+            print(f"Rides table token fetch error (column may not exist): {e}")
+        try:
+            # users table से
+            u_res = supabase.table("users").select("fcm_token").eq("device_id", rider_user_id).limit(1).execute()
+            if u_res.data and u_res.data[0].get("fcm_token"):
+                rider_token = u_res.data[0].get("fcm_token")
+            else:
+                u_res = supabase.table("users").select("fcm_token").eq("user_id", rider_user_id).limit(1).execute()
+                if u_res.data:
+                    rider_token = u_res.data[0].get("fcm_token")
+        except Exception as e:
+            print(f"Get rider token error {e}")
+        if not rider_token:
+            print(f"No FCM token for rider {rider_user_id}")
+            return False
+        # IMPORTANT: सिर्फ data भेजो, notification मत भेजो - नहीं तो Background Handler नहीं चलेगा
+        message = messaging.Message(
+            token=rider_token,
+            data={
+                "type": "incoming_call",
+                "callerName": driver_name or "Driver",
+                "callerId": str(driver_id),
+                "driver_name": driver_name or "Driver",
+                "driver_id": str(driver_id),
+                "ride_id": str(ride_id),
+                "is_call": "true"
+            },
+            android=messaging.AndroidConfig(
+                priority="high"
+            )
+        )
+        response = messaging.send(message)
+        print(f"✅ Call FCM sent to rider {rider_user_id}: {response}")
+        return True
+    except Exception as e:
+        print(f"❌ Call FCM Error: {e}")
+        return False
+
+
 def archive_and_delete_ride(ride_id: int):
     try:
         local_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -1458,6 +1511,69 @@ def get_all_rides_admin(status: str = Query(None), limit: int = Query(100)):
         return enriched
     except Exception as e:
         return {"error": str(e)}
+
+class CallNotifyRequest(BaseModel):
+    rider_user_id: str
+    driver_name: str
+    driver_id: str
+@app.post("/rides/{ride_id}/notify-call")
+def notify_rider_for_call(ride_id: int, payload: CallNotifyRequest):
+    """
+    Driver Call करने से पहले ये API Call करेगा
+    """
+    try:
+        success = send_rider_call_fcm(
+            rider_user_id=payload.rider_user_id,
+            driver_name=payload.driver_name,
+            driver_id=payload.driver_id,
+            ride_id=ride_id
+        )
+        if success:
+            return {"success": True, "message": "Call FCM sent to rider"}
+        else:
+            return {"success": False, "message": "Rider FCM token not found, but call can continue via Stringee"}
+    except Exception as e:
+        print(f"notify-call error {e}")
+        return {"success": False, "error": str(e)}
+
+class UserFcmRequest(BaseModel):
+    user_id: str
+    fcm_token: str
+    device_id: Optional[str] = None
+@app.post("/users/fcm")
+def save_user_fcm(payload: UserFcmRequest):
+    try:
+        uid = payload.user_id or payload.device_id
+        if not uid:
+            raise HTTPException(400, "user_id required")
+        # Check if user exists
+        existing = supabase.table("users").select("id").eq("device_id", uid).limit(1).execute()
+        if existing.data:
+            supabase.table("users").update({
+                "fcm_token": payload.fcm_token,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }).eq("device_id", uid).execute()
+        else:
+            # Try by user_id
+            existing2 = supabase.table("users").select("id").eq("user_id", uid).limit(1).execute()
+            if existing2.data:
+                supabase.table("users").update({
+                    "fcm_token": payload.fcm_token
+                }).eq("user_id", uid).execute()
+            else:
+                # Insert new
+                supabase.table("users").insert({
+                    "device_id": uid,
+                    "user_id": uid,
+                    "fcm_token": payload.fcm_token,
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }).execute()
+        print(f"✅ Rider FCM saved: {uid}")
+        return {"success": True}
+    except Exception as e:
+        print(f"User FCM save error: {e}")
+        return {"success": False, "error": str(e)}
+
 
 @app.get("/admin/stats")
 def get_admin_stats():
