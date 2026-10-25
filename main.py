@@ -341,6 +341,8 @@ class RideCreateRequest(BaseModel):
     trip_type: str="ride"
     otp: str
     seats: int = 1
+    fcm_token: Optional[str] = None           # <-- ADD
+    rider_fcm_token: Optional[str] = None     # <-- ADD
     rider_name: Optional[str] = None
     rider_phone: Optional[str] = None
     rider_id: Optional[str] = None
@@ -1146,6 +1148,8 @@ async def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
         "max_pool_seats": max_seats if final_trip == "pool" else None,
         "rider_name": payload.rider_name,
         "rider_phone": payload.rider_phone,
+        "fcm_token": payload.fcm_token or payload.rider_fcm_token,              # <-- ADD
+        "rider_fcm_token": payload.rider_fcm_token or payload.fcm_token,        # <-- ADD
     }
 
     # 9. डेटाबेस में डालें
