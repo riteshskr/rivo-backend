@@ -1015,13 +1015,19 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
     return filtered
 
 @app.get("/vehicles")
-def get_vehicles():
+def get_vehicles(country_code: str = Query(None)):
     try:
-        res = supabase.table("vehicles").select("id, name, fare_per_km, night_fare_per_km, min_fare, parcel_per_km, parcel_night_per_km, parcel_min_fare, pool_per_km, pool_night_per_km, pool_min_fare, pool_parcel_per_km, pool_parcel_per_km_night, has_pool, has_offer, has_offer_pool, pool_parcel_min_fare, max_pool_seats, icon_path").order("id", desc=False).execute()
+        q = supabase.table("vehicles").select("*").order("name", desc=False)
+        if country_code:
+            q = q.eq("country_code", country_code.lower())
+        res = q.execute()
+        print(f"VEHICLES: country={country_code} found={len(res.data or [])}")
         return res.data or []
     except Exception as e:
-        print(f"Error fetching vehicles: {e}")
+        print(f"vehicles error {e}")
         return []
+
+
 @app.get("/rides/{ride_id}")
 def get_ride(ride_id: int):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
@@ -1308,7 +1314,7 @@ def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
-    res = supabase.table("rides").select("*").or_(f"driver_id.eq.{driver_id},id.eq.{driver_id}").in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
+    res = supabase.table("rides").select("*").eq("driver_id", driver_id).in_("status", ["accepted", "started", "arrived", "rider_accepted"]).order("id", desc=True).limit(10).execute()
     if res.data:
         enriched = [enrich_ride_with_driver(r) for r in res.data]
         for r in enriched:
