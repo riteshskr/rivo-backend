@@ -202,34 +202,54 @@ class ConnectionManager:
                     pass
     async def connect_driver(self, ws: WebSocket, vehicle_type: str = "", lat: float = None, lng: float = None, driver_range: float = None, driver_id: str = ""):
         await ws.accept()
-        self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
+        self.driver_connections = [d for d in self.driver_connections if d["ws"] != ws]
         if driver_id:
-            self.driver_connections = [d for d in self.driver_connections if d.get("driver_id")!= driver_id]
-        self.driver_connections.append({"ws": ws, "vehicle_type": vehicle_type.lower().strip(), "lat": lat, "lng": lng, "range": driver_range, "driver_id": driver_id})
+            self.driver_connections = [d for d in self.driver_connections if d.get("driver_id") != driver_id]
+        self.driver_connections.append({
+            "ws": ws, 
+            "vehicle_type": vehicle_type.lower().strip(), 
+            "lat": lat, 
+            "lng": lng, 
+            "range": driver_range, 
+            "driver_id": driver_id
+        })
+    def update_driver_location(self, driver_id: str, lat: float, lng: float):
+        for d in self.driver_connections:
+            if d.get("driver_id") == driver_id:
+                d["lat"] = lat
+                d["lng"] = lng
     def disconnect_driver(self, ws: WebSocket):
-        self.driver_connections = [d for d in self.driver_connections if d["ws"]!= ws]
+        self.driver_connections = [d for d in self.driver_connections if d["ws"] != ws]
     async def broadcast_new_ride(self, ride_data: dict):
         req_type = str(ride_data.get('vehicle_type','')).lower().strip()
+        if not req_type:
+            return
         p_lat = float(ride_data.get('pickup_lat', 0))
         p_lng = float(ride_data.get('pickup_lng', 0))
+        if p_lat == 0 or p_lng == 0:
+            return
         safe_ride = {k: v for k, v in ride_data.items() if k != 'otp'}
         dead = []
         for driver in list(self.driver_connections):
             ws = driver["ws"]
             driver_v = str(driver.get("vehicle_type","")).lower().strip()
-            # 1. Vehicle type check - must match
-            if driver_v != req_type:
+            # VEHICLE CHECK - खाली हो तो भी skip, car को bike मत भेजो
+            if not driver_v or driver_v != req_type:
                 continue
-            # 2. Location check - अगर location नहीं भेजा तो बिल्कुल skip
             d_lat = driver.get("lat")
             d_lng = driver.get("lng")
+            # LOCATION CHECK - location नहीं तो बिल्कुल मत भेजो
             if d_lat is None or d_lng is None:
                 continue
-            # 3. Range check
             try:
+                d_lat_f = float(d_lat)
+                d_lng_f = float(d_lng)
+                if d_lat_f == 0 or d_lng_f == 0:
+                    continue
                 drange = get_range_by_vehicle(driver_v, driver.get("range"))
-                dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if not is_within_range(drange, dist):
+                dist = haversine(d_lat_f, d_lng_f, p_lat, p_lng)
+                # RANGE CHECK - range के बाहर हो तो skip
+                if drange is not None and dist > float(drange):
                     continue
             except:
                 continue
@@ -255,6 +275,8 @@ class ConnectionManager:
             except:
                 pass
 
+
+
 manager = ConnectionManager()
 
 def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
@@ -262,6 +284,8 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         if not firebase_admin._apps:
             return
         v_type = vehicle_type.strip().lower()
+        if not v_type:
+            return
         all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range,is_active,is_online").eq("is_online", True).neq("fcm_token", "").execute().data or []
         tokens = []
         p_lat = float(ride_data.get('pickup_lat', 0))
@@ -270,17 +294,18 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             if d.get('is_active') == False:
                 continue
             d_v = str(d.get('vehicle_type','')).lower().strip()
-            if d_v != v_type:
+            if not d_v or d_v != v_type:
                 continue
-            # --- MAIN FIX: Location नहीं तो token मत लो ---
             d_lat = d.get('current_latitude')
             d_lng = d.get('current_longitude')
             if d_lat is None or d_lng is None:
                 continue
             try:
+                if float(d_lat) == 0 or float(d_lng) == 0:
+                    continue
                 drange = get_range_by_vehicle(d_v, d.get('range'))
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-                if not is_within_range(drange, dist):
+                if drange is not None and dist > float(drange):
                     continue
             except:
                 continue
@@ -288,7 +313,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
                 tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
         if not tokens:
-            print("No tokens - सब या तो offline हैं या location नहीं भेज रहे")
+            print("No tokens - कोई driver range/location में नहीं")
             return
         trip = str(ride_data.get('trip_type','ride')).lower()
         seats_info = ""
@@ -1337,21 +1362,44 @@ def get_active_ride(driver_id: str):
 @app.websocket("/ws/drivers")
 async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = Query(None), lng: float = Query(None), driver_id: str = Query(None)):
     drange = None
+    db_vehicle = ""
     if driver_id:
         try:
-            d_res = supabase.table("drivers").select("range, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+            d_res = supabase.table("drivers").select("range, vehicle_type, current_latitude, current_longitude").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
             if d_res.data:
-                drange = get_range_by_vehicle(d_res.data[0].get("vehicle_type"), d_res.data[0].get("range"))
-                if not vehicle_type:
-                    vehicle_type = d_res.data[0].get("vehicle_type","")
+                row = d_res.data[0]
+                drange = get_range_by_vehicle(row.get("vehicle_type"), row.get("range"))
+                db_vehicle = row.get("vehicle_type","")
+                # अगर query में lat नहीं आया तो DB वाला use करो
+                if lat is None:
+                    lat = row.get("current_latitude")
+                if lng is None:
+                    lng = row.get("current_longitude")
         except:
             pass
+    if not vehicle_type:
+        vehicle_type = db_vehicle
     await manager.connect_driver(ws, vehicle_type, lat, lng, drange, driver_id)
     try:
         while True:
-            await ws.receive_text()
+            try:
+                data = await ws.receive_text()
+                # Driver app हर 10 sec location भेजता है -> {"type":"location_update","lat":..,"lng":..}
+                j = json.loads(data)
+                if j.get("type") == "location_update":
+                    nlat = j.get("lat") or j.get("latitude")
+                    nlng = j.get("lng") or j.get("longitude")
+                    if nlat and nlng:
+                        manager.update_driver_location(driver_id, float(nlat), float(nlng))
+            except json.JSONDecodeError:
+                # plain text ignore
+                pass
+            except:
+                pass
     except WebSocketDisconnect:
         manager.disconnect_driver(ws)
+
+
 
 @app.websocket("/ws/ride/{ride_id}")
 async def ws_ride(ws: WebSocket, ride_id: int):
