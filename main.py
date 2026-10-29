@@ -516,6 +516,31 @@ def archive_and_delete_ride(ride_id: int):
 
 TIMEOUT_MINUTES = 10
 
+
+# ========== INTERNAL KEEP-ALIVE (Render ko sone se rokne ke liye) ==========
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://rivo-api-ezoo.onrender.com"
+
+async def self_keepalive_ping():
+    await asyncio.sleep(30) # startup ke 30 sec baad shuru
+    print(f"Internal Keep-Alive started - will ping {RENDER_URL}/ every 4 min")
+    while True:
+        try:
+            await asyncio.sleep(240) # 4 min
+            async with httpx.AsyncClient(timeout=10) as client:
+                # Apne aap ko hi ping karo - isse Render ko lagega inbound traffic hai
+                r = await client.get(f"{RENDER_URL}/", timeout=10)
+                print(f"SELF PING OK: {r.status_code} {r.text[:50]}")
+                # Ek extra health ping bhi
+                try:
+                    await client.get(f"{RENDER_URL}/health", timeout=10)
+                except:
+                    pass
+        except Exception as e:
+            print(f"SELF PING FAIL (Render maybe waking): {e}")
+            # Fail hone par bhi loop chalta rahega
+
+# ========== END KEEP-ALIVE ==========
+
 async def auto_timeout_checker():
     await asyncio.sleep(5)
     while True:
@@ -601,26 +626,8 @@ async def check_timeout_now():
 
 @app.get("/")
 def root():
-    return {"status":"Rivo API 23.0 Optimized - All Features Same OK"}
-@app.get("/rides")
-def get_rides_by_user(user_id: str = Query(...)):
-    try:
-        res = supabase.table("rides").select("*").eq("user_id", user_id).order("id", desc=True).limit(100).execute()
-        rides = res.data or []
-        try:
-            arch = supabase.table("rides_archive").select("*").eq("user_id", user_id).order("id", desc=True).limit(50).execute()
-            rides = rides + (arch.data or [])
-        except:
-            pass
-        enriched = []
-        for r in rides:
-            if r.get("driver_id"):
-                r = enrich_ride_with_driver(r)
-            enriched.append(r)
-        return {"rides": enriched, "count": len(enriched)}
-    except Exception as e:
-        print(f"get_rides error {e}")
-        raise HTTPException(500, str(e))
+    return {"status":"Rivo API 23.0 Optimized - All Features Same OK", "ok": True}
+
 @app.get("/rides/advance/{user_id}")
 def get_advance_rides(user_id: str):
     try:
