@@ -212,21 +212,27 @@ class ConnectionManager:
         req_type = str(ride_data.get('vehicle_type','')).lower().strip()
         p_lat = float(ride_data.get('pickup_lat', 0))
         p_lng = float(ride_data.get('pickup_lng', 0))
-        # FIX: OTP ko broadcast se hataya
         safe_ride = {k: v for k, v in ride_data.items() if k != 'otp'}
         dead = []
         for driver in list(self.driver_connections):
             ws = driver["ws"]
             driver_v = str(driver.get("vehicle_type","")).lower().strip()
-            if driver_v and req_type and driver_v!= req_type:
+            # 1. Vehicle type check - must match
+            if driver_v != req_type:
                 continue
+            # 2. Location check - अगर location नहीं भेजा तो बिल्कुल skip
             d_lat = driver.get("lat")
             d_lng = driver.get("lng")
-            if d_lat and d_lng:
+            if d_lat is None or d_lng is None:
+                continue
+            # 3. Range check
+            try:
                 drange = get_range_by_vehicle(driver_v, driver.get("range"))
-                dist = haversine(d_lat, d_lng, p_lat, p_lng)
+                dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
                 if not is_within_range(drange, dist):
                     continue
+            except:
+                continue
             try:
                 await ws.send_text(json.dumps({"type":"new_ride_alert","ride":safe_ride}, default=str))
             except:
@@ -256,7 +262,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         if not firebase_admin._apps:
             return
         v_type = vehicle_type.strip().lower()
-        all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range,is_active").eq("is_online", True).neq("fcm_token", "").execute().data or []
+        all_drivers = supabase.table("drivers").select("fcm_token,vehicle_type,current_latitude,current_longitude,range,is_active,is_online").eq("is_online", True).neq("fcm_token", "").execute().data or []
         tokens = []
         p_lat = float(ride_data.get('pickup_lat', 0))
         p_lng = float(ride_data.get('pickup_lng', 0))
@@ -264,20 +270,25 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             if d.get('is_active') == False:
                 continue
             d_v = str(d.get('vehicle_type','')).lower().strip()
-            if d_v!= v_type:
+            if d_v != v_type:
                 continue
+            # --- MAIN FIX: Location नहीं तो token मत लो ---
             d_lat = d.get('current_latitude')
             d_lng = d.get('current_longitude')
-            if d_lat and d_lng:
+            if d_lat is None or d_lng is None:
+                continue
+            try:
                 drange = get_range_by_vehicle(d_v, d.get('range'))
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
                 if not is_within_range(drange, dist):
                     continue
+            except:
+                continue
             if d.get('fcm_token'):
                 tokens.append(d['fcm_token'])
         tokens = list(set(tokens))
         if not tokens:
-            print("No tokens")
+            print("No tokens - सब या तो offline हैं या location नहीं भेज रहे")
             return
         trip = str(ride_data.get('trip_type','ride')).lower()
         seats_info = ""
@@ -290,16 +301,14 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         else:
             title = f"RIDE {vehicle_type}!"
         body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | ₹{ride_data.get('fare','')}"
-        # FINAL FIX: Channel ID को ड्राइवर App के बराबर किया और sound='alert' हटाया
         android_notif = messaging.AndroidNotification(
-            channel_id='ride_channel_v6_final',  # <-- आपके ड्राइवर App वाला ID
+            channel_id='ride_channel_v6_final',
             priority='max', 
             visibility='public',
         )
         android_config = messaging.AndroidConfig(priority='high', notification=android_notif)
         apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1, content_available=True)))
         safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
-        # एक-एक Token पर भेजो ताकि एक खराब Token से सब Fail न हो
         for token in tokens:
             msg = messaging.Message(
                 token=token,
@@ -324,6 +333,8 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         print(f"FCM Alert sent to {len(tokens)} drivers - Channel v6_final")
     except Exception as e:
         print(f"FCM Error {e}")
+
+
 
 class RideCreateRequest(BaseModel):
     pickup_lat: float
