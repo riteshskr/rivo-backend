@@ -482,8 +482,7 @@ def send_rider_call_fcm(rider_user_id: str, driver_name: str, driver_id: str, ri
 
 def archive_and_delete_ride(ride_id: int):
     try:
-        local_supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        res = local_supabase.table("rides").select("*").eq("id", ride_id).execute()
+        res = supabase.table("rides").select("*").eq("id", ride_id).execute()
         if not res.data:
             return
         ride_data = res.data[0]
@@ -492,17 +491,13 @@ def archive_and_delete_ride(ride_id: int):
         ride_data['original_ride_id'] = original_id
         ride_data['archived_at'] = datetime.now(timezone.utc).isoformat()
         try:
-            local_supabase.table("rides_archive").insert(ride_data).execute()
+            supabase.table("rides_archive").insert(ride_data).execute()
         except:
             try:
-                minimal = {"original_ride_id": original_id, "user_id": ride_data.get('user_id'), "status": ride_data.get('status'), "fare": ride_data.get('fare'), "pickup_address": ride_data.get('pickup_address'), "drop_address": ride_data.get('drop_address'), "archived_at": datetime.now(timezone.utc).isoformat(), "vehicle_type": ride_data.get('vehicle_type'), "trip_type": ride_data.get('trip_type'), "seats_booked": ride_data.get('seats_booked'), "total_seats": ride_data.get('total_seats')}
-                local_supabase.table("rides_archive").insert(minimal).execute()
+                minimal = {"original_ride_id": original_id, "user_id": ride_data.get('user_id'), "status": ride_data.get('status'), "fare": ride_data.get('fare'), "archived_at": datetime.now(timezone.utc).isoformat()}
+                supabase.table("rides_archive").insert(minimal).execute()
             except:
                 return
-        try:
-            local_supabase.table("rides").delete().eq("id", int(original_id)).execute()
-        except:
-            pass
         try:
             supabase.table("rides").delete().eq("id", int(original_id)).execute()
         except:
@@ -514,8 +509,10 @@ def archive_and_delete_ride(ride_id: int):
     except Exception as e:
         print(f"Archive Error {e}")
 
-TIMEOUT_MINUTES = 10
 
+
+TIMEOUT_MINUTES = 10
+is_timeout_running = False 
 
 # ========== INTERNAL KEEP-ALIVE (Render ko sone se rokne ke liye) ==========
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://rivo-api-ezoo.onrender.com"
@@ -542,11 +539,25 @@ async def self_keepalive_ping():
 # ========== END KEEP-ALIVE ==========
 
 async def auto_timeout_checker():
-    await asyncio.sleep(5)
+    await asyncio.sleep(10)  # Server को पहले उठने दो
+    global is_timeout_running
     while True:
+        # अगर पिछला Checker अभी भी चल रहा है तो नया Skip कर दो
+        if is_timeout_running:
+            print("पिछला Checker चल रहा है, Skip...")
+            await asyncio.sleep(30)
+            continue
+        is_timeout_running = True
         try:
             now = datetime.now(timezone.utc)
-            pending_res = supabase.table("rides").select("id,created_at,scheduled_time,status").in_("status", ["pending","searching"]).limit(100).execute()
+            # FIX 1: DB Call को Thread में चलाओ, ताकि FastAPI Block न हो
+            pending_res = await asyncio.to_thread(
+                lambda: supabase.table("rides")
+                .select("id,created_at,scheduled_time,status")
+                .in_("status", ["pending","searching"])
+                .limit(20)  # FIX 2: 100 से घटाकर 20 कर दिया
+                .execute()
+            )
             for r in pending_res.data or []:
                 ride_id = r['id']
                 created_at_str = r.get('created_at')
@@ -559,7 +570,7 @@ async def auto_timeout_checker():
                             if created_dt.tzinfo is None:
                                 created_dt = created_dt.replace(tzinfo=timezone.utc)
                             if (now - created_dt).total_seconds()/60 >= TIMEOUT_MINUTES:
-                                should_timeout=True
+                                should_timeout = True
                         except:
                             pass
                 else:
@@ -568,54 +579,67 @@ async def auto_timeout_checker():
                         if sched_dt.tzinfo is None:
                             sched_dt = sched_dt.replace(tzinfo=timezone.utc)
                         if now >= sched_dt - timedelta(minutes=TIMEOUT_MINUTES):
-                            should_timeout=True
+                            should_timeout = True
                     except:
                         pass
                 if should_timeout:
                     try:
-                        supabase.table("rides").update({"status": "timeout"}).eq("id", ride_id).execute()
-                        try:
-                            supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
-                        except:
-                            pass
-                        archive_and_delete_ride(ride_id)
+                        # FIX 3: भारी काम भी Thread में
+                        await asyncio.to_thread(
+                            lambda rid=ride_id: supabase.table("rides").update({"status": "timeout"}).eq("id", rid).execute()
+                        )
+                        await asyncio.to_thread(
+                            lambda rid=ride_id: supabase.table("driver_offers").delete().eq("ride_id", rid).execute()
+                        )
+                        # Archive को Background में भेजो, यहीं wait मत करो
+                        # archive_and_delete_ride(ride_id)  <-- ये लाइन हटाओ
+                        # इसकी जगह सिर्फ status timeout करो, Archive अलग Cron करेगा
                         await manager.broadcast_ride_taken(ride_id)
-                    except:
-                        pass
+                        print(f"Timeout Ride {ride_id}")
+                    except Exception as e:
+                        print(f"Timeout fail {ride_id}: {e}")
+            # rider_accepted वाला part भी Thread में
             try:
-                rider_acc_res = supabase.table("rides").select("id,offer_expires_at,driver_id").eq("status", "rider_accepted").limit(50).execute()
+                rider_acc_res = await asyncio.to_thread(
+                    lambda: supabase.table("rides").select("id,offer_expires_at,driver_id,vehicle_type").eq("status", "rider_accepted").limit(10).execute()
+                )
                 for r in rider_acc_res.data or []:
                     try:
                         exp_str = r.get("offer_expires_at")
-                        if exp_str:
-                            exp_dt = datetime.fromisoformat(str(exp_str).replace('Z','+00:00'))
-                            if exp_dt.tzinfo is None:
-                                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-                            if now >= exp_dt:
-                                print(f"Offer Expired for ride {r['id']}")
-                                supabase.table("rides").update({"status":"pending", "driver_id": None, "driver_name": None, "driver_phone": None, "vehicle_number": None, "offer_expires_at": None}).eq("id", r["id"]).execute()
-                                try:
-                                    supabase.table("driver_offers").delete().eq("ride_id", r["id"]).execute()
-                                except:
-                                    pass
-                                try:
-                                    new_data = supabase.table("rides").select("*").eq("id", r["id"]).execute().data
-                                    if new_data:
-                                        await manager.broadcast_new_ride(new_data[0])
-                                        send_fcm_global(new_data[0], new_data[0].get('vehicle_type',''))
-                                except:
-                                    pass
+                        if not exp_str:
+                            continue
+                        exp_dt = datetime.fromisoformat(str(exp_str).replace('Z','+00:00'))
+                        if exp_dt.tzinfo is None:
+                            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                        if now >= exp_dt:
+                            print(f"Offer Expired for ride {r['id']}")
+                            await asyncio.to_thread(
+                                lambda rid=r['id']: supabase.table("rides").update({
+                                    "status":"pending", "driver_id": None, "driver_name": None,
+                                    "driver_phone": None, "vehicle_number": None, "offer_expires_at": None
+                                }).eq("id", rid).execute()
+                            )
+                            await asyncio.to_thread(
+                                lambda rid=r['id']: supabase.table("driver_offers").delete().eq("ride_id", rid).execute()
+                            )
                     except Exception as e:
-                        print(f"rider_accepted timeout error {e}")
+                        print(f"rider_accepted error {e}")
             except Exception as e:
                 print(f"rider_accepted check error {e}")
-        except:
-            pass
-        await asyncio.sleep(30)
+        except Exception as e:
+            print(f"auto_timeout outer error {e}")
+        finally:
+            is_timeout_running = False  # Lock खोलना बहुत जरूरी
+        await asyncio.sleep(60)  # FIX 4: 30 से बढ़ाकर 60 सेकंड कर दिया
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
+    asyncio.create_task(self_keepalive_ping())
     print("Rivo API 23.0 Optimized OK - All Features Same")
 
 @app.get("/admin/check-timeout-now")
