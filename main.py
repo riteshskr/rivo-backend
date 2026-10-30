@@ -37,6 +37,10 @@ except Exception as e:
 
 # --- HELPERS (Optimized but Same Feature) ---
 # --- TRANSLATION HELPER (100% Free) ---
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    return {"status":"Rivo API 23.0 Optimized OK", "ok": True}
+@app.api_route("/health", methods=["GET", "HEAD"])
 
 
 def to_hindi_free(text: str) -> str:
@@ -662,6 +666,22 @@ def get_advance_rides(user_id: str):
     except Exception as e:
         print(f"advance rides error {e}")
         return {"rides": [], "count": 0}
+@app.put("/drivers/{driver_id}/offline")
+def set_driver_offline(driver_id: str):
+    try:
+        # 1. DB में offline करो
+        supabase.table("drivers").update({
+            "is_online": False, 
+            "last_seen": datetime.now(timezone.utc).isoformat()
+        }).or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").execute()
+        # 2. Memory से भी निकालो
+        manager.driver_connections = [d for d in manager.driver_connections if d.get("driver_id") != driver_id]
+        print(f"Driver {driver_id} OFFLINE - memory se nikala")
+        return {"success": True}
+    except Exception as e:
+        print(f"offline error {e}")
+        return {"success": False}
+
 
 @app.put("/rides/{ride_id}/offer")
 async def driver_make_offer(ride_id: int, payload: DriverOfferRequest):
