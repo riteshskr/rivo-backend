@@ -41,8 +41,8 @@ except Exception as e:
 def root():
     return {"status":"Rivo API 23.0 Optimized OK", "ok": True}
 @app.api_route("/health", methods=["GET", "HEAD"])
-
-
+def health_check():
+    return {"status":"ok", "ok": True}
 def to_hindi_free(text: str) -> str:
     if not text or not text.strip():
         return ""
@@ -55,6 +55,8 @@ def to_hindi_free(text: str) -> str:
     except Exception as e:
         print(f"Translate Error: {e}")
     return text
+
+
 
 
 
@@ -518,30 +520,6 @@ def archive_and_delete_ride(ride_id: int):
 TIMEOUT_MINUTES = 10
 is_timeout_running = False 
 
-# ========== INTERNAL KEEP-ALIVE (Render ko sone se rokne ke liye) ==========
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://rivo-api-ezoo.onrender.com"
-
-async def self_keepalive_ping():
-    await asyncio.sleep(30) # startup ke 30 sec baad shuru
-    print(f"Internal Keep-Alive started - will ping {RENDER_URL}/ every 4 min")
-    while True:
-        try:
-            await asyncio.sleep(240) # 4 min
-            async with httpx.AsyncClient(timeout=10) as client:
-                # Apne aap ko hi ping karo - isse Render ko lagega inbound traffic hai
-                r = await client.get(f"{RENDER_URL}/", timeout=10)
-                print(f"SELF PING OK: {r.status_code} {r.text[:50]}")
-                # Ek extra health ping bhi
-                try:
-                    await client.get(f"{RENDER_URL}/health", timeout=10)
-                except:
-                    pass
-        except Exception as e:
-            print(f"SELF PING FAIL (Render maybe waking): {e}")
-            # Fail hone par bhi loop chalta rahega
-
-# ========== END KEEP-ALIVE ==========
-
 async def auto_timeout_checker():
     await asyncio.sleep(10)  # Server को पहले उठने दो
     global is_timeout_running
@@ -636,14 +614,12 @@ async def auto_timeout_checker():
             is_timeout_running = False  # Lock खोलना बहुत जरूरी
         await asyncio.sleep(60)  # FIX 4: 30 से बढ़ाकर 60 सेकंड कर दिया
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
+
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    asyncio.create_task(self_keepalive_ping())
+   
     print("Rivo API 23.0 Optimized OK - All Features Same")
 
 @app.get("/admin/check-timeout-now")
@@ -652,9 +628,6 @@ async def check_timeout_now():
     pending = supabase.table("rides").select("id,created_at,scheduled_time,seats_booked,total_seats,pool_group_id,status").in_("status", ["pending","rider_accepted","searching"]).execute().data or []
     return {"now_utc": now.isoformat(), "pending_count": len(pending), "rides": pending}
 
-@app.get("/")
-def root():
-    return {"status":"Rivo API 23.0 Optimized - All Features Same OK", "ok": True}
 
 @app.get("/rides/advance/{user_id}")
 def get_advance_rides(user_id: str):
