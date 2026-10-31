@@ -263,6 +263,16 @@ class ConnectionManager:
             driver_v = str(driver.get("vehicle_type","")).lower().strip()
             # VEHICLE CHECK - खाली हो तो भी skip, car को bike मत भेजो
             if not driver_v or driver_v != req_type:
+               continue
+            # 2. Status null या ok हो
+            d_status = str(driver.get("status") or "").lower().strip()
+            if d_status not in ["", "null", "none", "ok", "available", "free"]:
+               continue
+            # 3. is_online True हो (memory में)
+            if driver.get("is_online") == False:
+               continue
+            # 4. is_active True हो
+            if driver.get("is_active") == False:
                 continue
             d_lat = driver.get("lat")
             d_lng = driver.get("lng")
@@ -321,6 +331,10 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         for d in all_drivers:
             if d.get('is_active') == False:
                 continue
+            d_status = str(d.get("status") or "").lower().strip()
+            if d_status not in ["", "null", "none", "ok", "available", "free"]:
+                 continue
+            
             d_v = str(d.get('vehicle_type','')).lower().strip()
             if not d_v or d_v != v_type:
                 continue
@@ -1058,6 +1072,11 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     drv = d_res.data[0]
+    drv_status = str(drv.get("status") or "").lower().strip()
+    if drv_status not in ["", "null", "none", "ok", "available", "free"]:
+        return []  # driver busy है तो कोई ride मत दिखाओ
+    if drv.get("is_active") == False or drv.get("is_online") == False:
+        return []
     d_lat = driver_lat if driver_lat is not None else drv.get("current_latitude")
     d_lng = driver_lng if driver_lng is not None else drv.get("current_longitude")
     d_vehicle = (vehicle_type or drv.get("vehicle_type") or "").strip()
