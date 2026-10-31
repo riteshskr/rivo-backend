@@ -56,10 +56,6 @@ def to_hindi_free(text: str) -> str:
         print(f"Translate Error: {e}")
     return text
 
-
-
-
-
 def haversine(lat1, lon1, lat2, lon2):
     try:
         R = 6371.0
@@ -70,6 +66,32 @@ def haversine(lat1, lon1, lat2, lon2):
         return R * c
     except:
         return 99999.0
+
+_vehicle_range_cache = {}
+_vehicle_cache_time = 0
+def get_range_from_vehicle_table(vehicle_type: str):
+    global _vehicle_range_cache, _vehicle_cache_time
+    try:
+        # 5 मिनट तक Cache रखो
+        now = time.time()
+        if now - _vehicle_cache_time > 300:
+            _vehicle_range_cache = {}
+            _vehicle_cache_time = now
+        v_type = vehicle_type.lower().strip()
+        if v_type in _vehicle_range_cache:
+            return _vehicle_range_cache[v_type]
+        # Vehicle Table से Range लो
+        res = supabase.table("vehicles").select("range").ilike("name", v_type).limit(1).execute()
+        if res.data and res.data[0].get("range"):
+            r = float(res.data[0]["range"])
+            _vehicle_range_cache[v_type] = r
+            print(f"Vehicle {v_type} Range = {r} KM (from vehicles table)")
+            return r
+    except Exception as e:
+        print(f"Vehicle range fetch error: {e}")
+    # Default अगर Vehicle में Range नहीं लिखा
+    return 5.0
+
 
 def get_range_by_vehicle(vehicle_type: str, db_range=None):
     if db_range is not None:
@@ -252,7 +274,7 @@ class ConnectionManager:
                 d_lng_f = float(d_lng)
                 if d_lat_f == 0 or d_lng_f == 0:
                     continue
-                drange = get_range_by_vehicle(driver_v, driver.get("range"))
+                drange = get_range_from_vehicle_table(driver_v)
                 dist = haversine(d_lat_f, d_lng_f, p_lat, p_lng)
                 # RANGE CHECK - range के बाहर हो तो skip
                 if drange is not None and dist > float(drange):
@@ -309,7 +331,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             try:
                 if float(d_lat) == 0 or float(d_lng) == 0:
                     continue
-                drange = get_range_by_vehicle(d_v, d.get('range'))
+                drange = get_range_from_vehicle_table(d_v)
                 dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
                 if drange is not None and dist > float(drange):
                     continue
@@ -1041,22 +1063,21 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
-    d_res = supabase.table("drivers").select("current_latitude, current_longitude, range, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+    d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     drv = d_res.data[0]
     d_lat = driver_lat if driver_lat is not None else drv.get("current_latitude")
     d_lng = driver_lng if driver_lng is not None else drv.get("current_longitude")
     d_vehicle = (vehicle_type or drv.get("vehicle_type") or "").strip()
-    driver_range = get_range_by_vehicle(d_vehicle, drv.get("range"))
+    # अब Vehicle Table से Range
+    driver_range = get_range_from_vehicle_table(d_vehicle)
     q = supabase.table("rides").select("*").in_("status",["pending","searching"]).order("id", desc=True).limit(50)
     if d_vehicle:
         q = q.eq("vehicle_type", d_vehicle)
     rides = q.execute().data or []
     if d_lat is None or d_lng is None:
-        for r in rides:
-            r.pop("otp", None)
-        return rides
+        return []
     filtered = []
     for ride in rides:
         try:
@@ -1065,7 +1086,7 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
             if p_lat==0 or p_lng==0:
                 continue
             dist = haversine(float(d_lat), float(d_lng), p_lat, p_lng)
-            if driver_range is None or dist <= float(driver_range):
+            if dist <= float(driver_range):
                 ride["distance_from_driver"] = round(dist, 2)
                 ride.pop("otp", None)
                 filtered.append(ride)
@@ -1073,6 +1094,8 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
             continue
     filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
     return filtered
+
+
 
 @app.get("/vehicles")
 def get_vehicles(country_code: str = Query(None)):
