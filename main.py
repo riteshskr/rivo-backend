@@ -25,6 +25,7 @@ STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "rivo_jaipur_2026_default")
+OTHER_SERVER_URL = os.getenv("OTHER_SERVER_URL")
 
 try:
     fj = os.getenv("FIREBASE_CREDENTIALS_JSON")
@@ -116,6 +117,7 @@ def get_time_slot(scheduled_time_str=None):
         if scheduled_time_str:
             dt = datetime.fromisoformat(str(scheduled_time_str).replace('Z','+00:00'))
             hour = dt.hour if dt.tzinfo is None else dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
+
         else:
             now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             hour = now_ist.hour
@@ -331,6 +333,9 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         for d in all_drivers:
             if d.get('is_active') == False:
                 continue
+            d_status = str(d.get("status") or "").lower().strip()
+            if d_status not in ["", "null", "none", "ok", "available", "free"]:
+                  continue  
             d_status = str(d.get("status") or "").lower().strip()
             if d_status not in ["", "null", "none", "ok", "available", "free"]:
                  continue
@@ -650,13 +655,25 @@ async def auto_timeout_checker():
             is_timeout_running = False  # Lock खोलना बहुत जरूरी
         await asyncio.sleep(60)  # FIX 4: 30 से बढ़ाकर 60 सेकंड कर दिया
 
-
-
+async def keep_other_awake():
+    if not OTHER_SERVER_URL:
+        print("OTHER_SERVER_URL not set - mutual ping skip")
+        return
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(f"{OTHER_SERVER_URL}/health?t={int(time.time())}")
+                print(f"✅ Pinged other -> {r.status_code}")
+        except Exception as e:
+            print(f"❌ Ping fail {e}")
+        await asyncio.sleep(240)
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-   
-    print("Rivo API 23.0 Optimized OK - All Features Same")
+    asyncio.create_task(keep_other_awake())
+    print("Rivo API 23.0 + Mutual Ping OK")
+
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -1068,7 +1085,8 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
-    d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+        d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type, status, is_active, is_online").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     drv = d_res.data[0]
