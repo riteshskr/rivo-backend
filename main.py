@@ -657,17 +657,36 @@ async def auto_timeout_checker():
 
 async def keep_other_awake():
     if not OTHER_SERVER_URL:
-        print("OTHER_SERVER_URL not set - mutual ping skip")
+        print("OTHER_SERVER_URL not set")
         return
-    await asyncio.sleep(60)
+    await asyncio.sleep(15)
     while True:
         try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.get(f"{OTHER_SERVER_URL}/health?t={int(time.time())}")
-                print(f"✅ Pinged other -> {r.status_code}")
+            async with httpx.AsyncClient(timeout=25) as client:
+                base = OTHER_SERVER_URL.rstrip('/')
+                # 3 URLs try करो, कोई एक तो जगाएगा
+                urls = [f"{base}/health", f"{base}/", f"{base}/health?t={int(time.time())}"]
+                for url in urls:
+                    try:
+                        r = await client.get(url)
+                        print(f"✅ Ping {url} -> {r.status_code}")
+                        if r.status_code == 200:
+                            break
+                        if r.status_code == 502:
+                            print("Other sleeping, retry in 20s...")
+                            await asyncio.sleep(20)
+                            r2 = await client.get(url)
+                            print(f"✅ Retry -> {r2.status_code}")
+                            if r2.status_code == 200:
+                                break
+                    except Exception as inner_e:
+                        print(f"Ping try fail {url}: {inner_e}")
+                        continue
         except Exception as e:
             print(f"❌ Ping fail {e}")
-        await asyncio.sleep(240)
+        await asyncio.sleep(60)
+
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
