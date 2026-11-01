@@ -3,7 +3,7 @@ name: Keep Render Alive
 on:
   schedule:
     # हर 10 मिनट में एक बार (GitHub की देरी को देखते हुए 15 मिनट से कम रहेगा)
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
