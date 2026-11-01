@@ -2,8 +2,7 @@ name: Keep Render Alive
 
 on:
   schedule:
-    # हर 10 मिनट में एक बार (GitHub की देरी को देखते हुए 15 मिनट से कम रहेगा)
-    - cron: '*/5 * * * *'
+    - cron: '*/5 * * * *' # हर 5 मिनट में
   workflow_dispatch:
 
 jobs:
@@ -13,10 +12,21 @@ jobs:
       - name: Ping Render health endpoint
         run: |
           echo "Pinging https://rivo-api-ezoo.onrender.com/health ..."
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 https://rivo-api-ezoo.onrender.com/health)
-          echo "HTTP status: $code"
-          if [ "$code" != "200" ]; then
-            echo "❌ Ping failed with status $code"
-            exit 1
-          fi
-          echo "✅ Render is awake"
+          # यहाँ हमने Retry (दोबारा कोशिश) वाला लॉजिक जोड़ा है
+          for i in {1..3}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 https://rivo-api-ezoo.onrender.com/health)
+            echo "Attempt $i: HTTP status: $code"
+            
+            # अगर 200 आया तो काम हो गया, लूप से बाहर निकल जाओ
+            if [ "$code" = "200" ]; then
+              echo "✅ Render is awake"
+              exit 0
+            fi
+            
+            # अगर 502 या 503 आया, तो 40 सेकंड रुककर दोबारा कोशिश करो
+            echo "⏳ Server is waking up. Waiting 40 seconds before retry..."
+            sleep 40
+          done
+          
+          echo "❌ Ping failed after multiple attempts"
+          exit 1
