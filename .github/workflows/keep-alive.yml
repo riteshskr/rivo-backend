@@ -13,7 +13,7 @@ jobs:
       - name: Ping Render health endpoint
         run: |
           echo "Pinging https://rivo-api-ezoo.onrender.com/health ..."
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 60 https://rivo-api-ezoo.onrender.com/health)
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 https://rivo-api-ezoo.onrender.com/health)
           echo "HTTP status: $code"
           if [ "$code" != "200" ]; then
             echo "❌ Ping failed with status $code"
