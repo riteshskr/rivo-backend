@@ -22,13 +22,27 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
 import httpx
+from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions  # 🔥 यह इम्पोर्ट जरूरी है
+
+# HTTP/1.1 वाला क्लाइंट बनाएं
+_httpx_client = httpx.Client(
+    http2=False,
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    limits=httpx.Limits(
+        max_keepalive_connections=10,
+        max_connections=40,
+        keepalive_expiry=15.0,
+    ),
+)
+
+# Supabase क्लाइंट को सही तरीके से बनाएं
 supabase: Client = create_client(
     SUPABASE_URL, 
     SUPABASE_KEY,
-    options={
-        "http_client": httpx.Client(http2=False) # 🔥 HTTP/2 बंद कर दिया
-    }
+    options=ClientOptions(httpx_client=_httpx_client)  # 🔥 ClientOptions का इस्तेमाल करें
 )
+
 
 STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
