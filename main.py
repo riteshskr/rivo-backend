@@ -11,7 +11,7 @@ from firebase_admin import credentials, messaging
 from deep_translator import MyMemoryTranslator
 from fastapi import BackgroundTasks
 import re
-import httpx
+
 
 load_dotenv()
 
@@ -21,7 +21,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+import httpx
+supabase: Client = create_client(
+    SUPABASE_URL, 
+    SUPABASE_KEY,
+    options={
+        "http_client": httpx.Client(http2=False) # 🔥 HTTP/2 बंद कर दिया
+    }
+)
 
 STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
