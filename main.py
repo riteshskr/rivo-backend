@@ -9,7 +9,9 @@ from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, messaging
 from deep_translator import MyMemoryTranslator
+from fastapi import BackgroundTasks
 import re
+import httpx
 
 load_dotenv()
 
@@ -335,11 +337,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
                 continue
             d_status = str(d.get("status") or "").lower().strip()
             if d_status not in ["", "null", "none", "ok", "available", "free"]:
-                  continue  
-            d_status = str(d.get("status") or "").lower().strip()
-            if d_status not in ["", "null", "none", "ok", "available", "free"]:
-                 continue
-            
+                continue
             d_v = str(d.get('vehicle_type','')).lower().strip()
             if not d_v or d_v != v_type:
                 continue
@@ -362,6 +360,7 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         if not tokens:
             print("No tokens - कोई driver range/location में नहीं")
             return
+
         trip = str(ride_data.get('trip_type','ride')).lower()
         seats_info = ""
         if "pool" in trip:
@@ -373,38 +372,37 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         else:
             title = f"RIDE {vehicle_type}!"
         body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | ₹{ride_data.get('fare','')}"
+
         android_notif = messaging.AndroidNotification(
             channel_id='ride_channel_v6_final',
-            priority='max', 
+            priority='max',
             visibility='public',
         )
         android_config = messaging.AndroidConfig(priority='high', notification=android_notif)
         apns_config = messaging.APNSConfig(payload=messaging.APNSPayload(aps=messaging.Aps(sound='default', badge=1, content_available=True)))
-        safe_ride = {k: v for k, v in ride_data.items() if k!= 'otp'}
-        for token in tokens:
-            msg = messaging.Message(
-                token=token,
-                notification=messaging.Notification(title=title, body=body),
-                data={
-                    'vehicle_type': v_type, 
-                    'trip_type': trip, 
-                    'ride_id': str(ride_data.get('id','')), 
-                    'type': 'new_ride_alert', 
-                    'fare': str(ride_data.get('fare','')), 
-                    'click_action': 'FLUTTER_NOTIFICATION_CLICK',
-                    'ride_json': json.dumps(safe_ride, default=str)
-                },
-                android=android_config,
-                apns=apns_config
-            )
-            try:
-                messaging.send(msg)
-            except Exception as e:
-                print(f"FCM fail {e}")
-                continue
-        print(f"FCM Alert sent to {len(tokens)} drivers - Channel v6_final")
+        safe_ride = {k: v for k, v in ride_data.items() if k != 'otp'}
+
+        # 🔥 एक ही कॉल में सभी ड्राइवर्स को मैसेज भेजें
+        message = messaging.MulticastMessage(
+            tokens=tokens,
+            notification=messaging.Notification(title=title, body=body),
+            data={
+                'vehicle_type': v_type,
+                'trip_type': trip,
+                'ride_id': str(ride_data.get('id','')),
+                'type': 'new_ride_alert',
+                'fare': str(ride_data.get('fare','')),
+                'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+                'ride_json': json.dumps(safe_ride, default=str)
+            },
+            android=android_config,
+            apns=apns_config
+        )
+        response = messaging.send_each_for_multicast(message)
+        print(f"✅ FCM Alert sent: {response.success_count} success, {response.failure_count} failed out of {len(tokens)} drivers")
     except Exception as e:
-        print(f"FCM Error {e}")
+        print(f"❌ FCM Error {e}")
+
 
 
 
@@ -691,8 +689,68 @@ async def keep_other_awake():
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
     asyncio.create_task(keep_other_awake())
+    
+    # 🔥 NAYA: स्टार्टअप पर Tunnel URL सिंक करने की कोशिश करें
+    asyncio.create_task(sync_tunnel_on_startup())
+    
     print("Rivo API 23.0 + Mutual Ping OK")
 
+async def sync_tunnel_on_startup():
+    """
+    स्टार्टअप पर cloudflared का इंतज़ार करें और URL सिंक करें
+    """
+    await asyncio.sleep(5)  # cloudflared को तैयार होने का समय दें
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get("http://127.0.0.1:20241/quicktunnel")
+                if response.status_code == 200:
+                    data = response.json()
+                    hostname = data.get("hostname")
+                    if hostname:
+                        new_url = f"https://{hostname}"
+                        supabase.table("app_config").update({"value": new_url}).eq("key", "api_base_url").execute()
+                        print(f"✅ Auto-synced Tunnel URL to Supabase: {new_url}")
+                        return
+        except Exception as e:
+            print(f"⚠️ Sync attempt {attempt + 1} failed: {e}")
+            await asyncio.sleep(3)
+    print("❌ Auto-sync failed after multiple attempts. You can manually call /admin/sync-tunnel-url")
+
+
+@app.get("/admin/sync-tunnel-url")
+async def sync_tunnel_url():
+    """
+    यह एंडपॉइंट लोकल cloudflared मेट्रिक्स सर्वर से Quick Tunnel URL पढ़ता है
+    और उसे Supabase के app_config टेबल में अपडेट कर देता है।
+    """
+    try:
+        # लोकल cloudflared मेट्रिक्स सर्वर से URL प्राप्त करें
+        async with httpx.AsyncClient(timeout=10) as client:
+            # ध्यान दें: पोर्ट 20241 आपके लॉग के अनुसार है, अगर बदले तो इसे अपडेट करें
+            response = await client.get("http://127.0.0.1:20241/quicktunnel")
+            
+            if response.status_code != 200:
+                raise HTTPException(500, "Tunnel URL not found. Is cloudflared running?")
+            
+            data = response.json()
+            hostname = data.get("hostname")
+            
+            if not hostname:
+                raise HTTPException(500, "No hostname found in tunnel response")
+
+            new_url = f"https://{hostname}"
+            print(f"🔄 Syncing Tunnel URL to Supabase: {new_url}")
+
+            # Supabase में api_base_url अपडेट करें
+            supabase.table("app_config").update({"value": new_url}).eq("key", "api_base_url").execute()
+            
+            return {"success": True, "url": new_url, "message": "Supabase updated!"}
+            
+    except Exception as e:
+        print(f"❌ Tunnel Sync Error: {e}")
+        raise HTTPException(500, str(e))
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -1104,7 +1162,7 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
-        d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type, status, is_active, is_online").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+    d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type, status, is_active, is_online").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
 
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
@@ -1173,7 +1231,7 @@ def get_ongoing(user_id: str):
     return enrich_ride_with_driver(res.data[0])
 
 @app.post("/rides")
-async def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
+async def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, user_id: str = Query(...)):
     # 1. Stringee टोकन जनरेट करें (राइडर कॉलिंग के लिए)
     token, clean_id = generate_stringee_token(user_id, "new")
 
@@ -1246,13 +1304,10 @@ async def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
             print(f"Pool seat check error {e}")
         correct_fare = correct_fare * seats_needed
 
-    # 7. हिंदी अनुवाद (यदि क्लाइंट ने हिंदी नहीं भेजी या अंग्रेजी भेजी है, तो सर्वर पर अनुवाद करें)
-    final_pickup_hi = payload.pickup_address_hi
-    final_drop_hi = payload.drop_address_hi
-    if (not final_pickup_hi or not re.search('[\u0900-\u097F]', final_pickup_hi)) and payload.pickup_address:
-        final_pickup_hi = to_hindi_free(payload.pickup_address)
-    if (not final_drop_hi or not re.search('[\u0900-\u097F]', final_drop_hi)) and payload.drop_address:
-        final_drop_hi = to_hindi_free(payload.drop_address)
+    # 7. 🔥 हिंदी अनुवाद हटा दिया गया है (सर्वर स्लो होने का मुख्य कारण)
+    # अगर हिंदी एड्रेस चाहिए तो ऐप से ही भेजें, या बैकग्राउंड में करें।
+    final_pickup_hi = payload.pickup_address_hi or payload.pickup_address
+    final_drop_hi = payload.drop_address_hi or payload.drop_address
 
     # 8. राइड डेटा बनाएं
     ride_data = {
@@ -1284,21 +1339,28 @@ async def create_ride(payload: RideCreateRequest, user_id: str = Query(...)):
         "max_pool_seats": max_seats if final_trip == "pool" else None,
         "rider_name": payload.rider_name,
         "rider_phone": payload.rider_phone,
-        "fcm_token": payload.fcm_token or payload.rider_fcm_token,              # <-- ADD
-        "rider_fcm_token": payload.rider_fcm_token or payload.fcm_token,        # <-- ADD
+        "fcm_token": payload.fcm_token or payload.rider_fcm_token,
+        "rider_fcm_token": payload.rider_fcm_token or payload.fcm_token,
     }
 
     # 9. डेटाबेस में डालें
-    res = supabase.table("rides").insert(ride_data).execute()
-    if not res.data:
-        raise HTTPException(500, "Failed to create ride")
+    try:
+        res = supabase.table("rides").insert(ride_data).execute()
+        if not res.data:
+            raise HTTPException(500, "Failed to create ride in DB")
+    except Exception as db_err:
+        print(f"❌ DB Insert Error: {db_err}")
+        raise HTTPException(500, f"Database Error: {str(db_err)}")
 
     new_ride = res.data[0]
 
-    # 10. ड्राइवरों को ब्रॉडकास्ट करें (WebSocket + FCM)
-    await manager.broadcast_new_ride(new_ride)
-    send_fcm_global(new_ride, payload.vehicle_type)
+    # 10. 🔥 सबसे बड़ा बदलाव: ब्रॉडकास्ट और FCM को बैकग्राउंड में भेजें 
+    # (इससे API तुरंत रिस्पॉन्स देगा और टाइमआउट नहीं होगा)
+    background_tasks.add_task(manager.broadcast_new_ride, new_ride)
+    background_tasks.add_task(send_fcm_global, new_ride, payload.vehicle_type)
 
+    # 11. तुरंत रिस्पॉन्स दें
+    print(f"✅ Ride Created Successfully ID: {new_ride.get('id')}")
     return new_ride
 
 

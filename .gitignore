@@ -22,6 +22,10 @@ ENV*/
 .env.development
 .env.production
 *.env
+.env1
+*.exe
+start_servers.bat
+run.txt
 
 # Flask / FastAPI / uploads
 instance/

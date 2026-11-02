@@ -25,6 +25,7 @@ STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "rivo_jaipur_2026_default")
+OTHER_SERVER_URL = os.getenv("OTHER_SERVER_URL")
 
 try:
     fj = os.getenv("FIREBASE_CREDENTIALS_JSON")
@@ -101,7 +102,7 @@ def get_range_by_vehicle(vehicle_type: str, db_range=None):
                 return r
         except:
             pass
-    return None
+    return get_range_from_vehicle_table(vehicle_type)
 
 def is_within_range(driver_range, distance):
     if driver_range is None:
@@ -116,6 +117,7 @@ def get_time_slot(scheduled_time_str=None):
         if scheduled_time_str:
             dt = datetime.fromisoformat(str(scheduled_time_str).replace('Z','+00:00'))
             hour = dt.hour if dt.tzinfo is None else dt.astimezone(timezone(timedelta(hours=5, minutes=30))).hour
+
         else:
             now_ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             hour = now_ist.hour
@@ -263,6 +265,16 @@ class ConnectionManager:
             driver_v = str(driver.get("vehicle_type","")).lower().strip()
             # VEHICLE CHECK - खाली हो तो भी skip, car को bike मत भेजो
             if not driver_v or driver_v != req_type:
+               continue
+            # 2. Status null या ok हो
+            d_status = str(driver.get("status") or "").lower().strip()
+            if d_status not in ["", "null", "none", "ok", "available", "free"]:
+               continue
+            # 3. is_online True हो (memory में)
+            if driver.get("is_online") == False:
+               continue
+            # 4. is_active True हो
+            if driver.get("is_active") == False:
                 continue
             d_lat = driver.get("lat")
             d_lng = driver.get("lng")
@@ -321,6 +333,13 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
         for d in all_drivers:
             if d.get('is_active') == False:
                 continue
+            d_status = str(d.get("status") or "").lower().strip()
+            if d_status not in ["", "null", "none", "ok", "available", "free"]:
+                  continue  
+            d_status = str(d.get("status") or "").lower().strip()
+            if d_status not in ["", "null", "none", "ok", "available", "free"]:
+                 continue
+            
             d_v = str(d.get('vehicle_type','')).lower().strip()
             if not d_v or d_v != v_type:
                 continue
@@ -636,13 +655,44 @@ async def auto_timeout_checker():
             is_timeout_running = False  # Lock खोलना बहुत जरूरी
         await asyncio.sleep(60)  # FIX 4: 30 से बढ़ाकर 60 सेकंड कर दिया
 
+async def keep_other_awake():
+    if not OTHER_SERVER_URL:
+        print("OTHER_SERVER_URL not set")
+        return
+    await asyncio.sleep(15)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=25) as client:
+                base = OTHER_SERVER_URL.rstrip('/')
+                # 3 URLs try करो, कोई एक तो जगाएगा
+                urls = [f"{base}/health", f"{base}/", f"{base}/health?t={int(time.time())}"]
+                for url in urls:
+                    try:
+                        r = await client.get(url)
+                        print(f"✅ Ping {url} -> {r.status_code}")
+                        if r.status_code == 200:
+                            break
+                        if r.status_code == 502:
+                            print("Other sleeping, retry in 20s...")
+                            await asyncio.sleep(20)
+                            r2 = await client.get(url)
+                            print(f"✅ Retry -> {r2.status_code}")
+                            if r2.status_code == 200:
+                                break
+                    except Exception as inner_e:
+                        print(f"Ping try fail {url}: {inner_e}")
+                        continue
+        except Exception as e:
+            print(f"❌ Ping fail {e}")
+        await asyncio.sleep(60)
 
 
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-   
-    print("Rivo API 23.0 Optimized OK - All Features Same")
+    asyncio.create_task(keep_other_awake())
+    print("Rivo API 23.0 + Mutual Ping OK")
+
 
 @app.get("/admin/check-timeout-now")
 async def check_timeout_now():
@@ -976,25 +1026,16 @@ def driver_login(payload: DriverLoginRequest):
     password_input = str(payload.password or "").strip()
     if not driver_input:
         raise HTTPException(400, "Phone/ID required")
-    res = supabase.table("drivers").select("*").or_(f"id.ilike.{driver_input},driver_id.ilike.{driver_input},phone.eq.{driver_input}").limit(1).execute()
-    if not res.data:
-        res = supabase.table("drivers").select("*").ilike("id", driver_input).limit(1).execute()
-    if not res.data:
-        res = supabase.table("drivers").select("*").ilike("driver_id", driver_input).limit(1).execute()
-    if not res.data:
-        res = supabase.table("drivers").select("*").eq("phone", driver_input).execute()
-    if not res.data:
-        raise HTTPException(404, "Driver not found")
-    driver = res.data[0]
-    if str(driver.get('password','')).strip()!= password_input:
+    driver = None
+    for field in ["id", "driver_id", "phone"]:
+        res = supabase.table("drivers").select("*").eq(field, driver_input).limit(1).execute()
+        if res.data:
+            driver = res.data[0]
+            break
+    if not driver:
+        raise HTTPException(404, f"Driver not found: {driver_input}")
+    if str(driver.get('password','')).strip() != password_input:
         raise HTTPException(401, "Wrong password")
-    if driver.get('is_active') == False:
-        raise HTTPException(403, "आपका Account Admin ने Pause किया है")
-    if payload.fcm_token:
-        try:
-            supabase.table("drivers").update({"fcm_token": payload.fcm_token, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", driver["id"]).execute()
-        except:
-            pass
     return driver
 
 @app.get("/maps/directions")
@@ -1063,10 +1104,16 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
-    d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+        d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type, status, is_active, is_online").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
     drv = d_res.data[0]
+    drv_status = str(drv.get("status") or "").lower().strip()
+    if drv_status not in ["", "null", "none", "ok", "available", "free"]:
+        return []  # driver busy है तो कोई ride मत दिखाओ
+    if drv.get("is_active") == False or drv.get("is_online") == False:
+        return []
     d_lat = driver_lat if driver_lat is not None else drv.get("current_latitude")
     d_lng = driver_lng if driver_lng is not None else drv.get("current_longitude")
     d_vehicle = (vehicle_type or drv.get("vehicle_type") or "").strip()
