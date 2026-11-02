@@ -688,10 +688,10 @@ async def keep_other_awake():
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
-    asyncio.create_task(keep_other_awake())
+ # asyncio.create_task(keep_other_awake())
     
     # 🔥 NAYA: स्टार्टअप पर Tunnel URL सिंक करने की कोशिश करें
-    asyncio.create_task(sync_tunnel_on_startup())
+  #asyncio.create_task(sync_tunnel_on_startup())
     
     print("Rivo API 23.0 + Mutual Ping OK")
 
