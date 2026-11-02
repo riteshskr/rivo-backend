@@ -1106,7 +1106,7 @@ async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)
         d_lat, d_lng = dest.split(',')
         # OSRM को lng,lat चाहिए होता है, lat,lng नहीं
         osrm_url = f"http://router.project-osrm.org/route/v1/driving/{o_lng.strip()},{o_lat.strip()};{d_lng.strip()},{d_lat.strip()}?overview=full&geometries=polyline"
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10, http2=False) as client:
             r = await client.get(osrm_url)
             data = r.json()
             if data.get("code") == "Ok" and data.get("routes"):
@@ -1127,7 +1127,7 @@ async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)
     if not GOOGLE_MAPS_API_KEY:
         raise HTTPException(500, "GOOGLE_MAPS_API_KEY not set")
     url = f"https://maps.googleapis.com/maps/api/directions/json?origin={origin}&destination={dest}&key={GOOGLE_MAPS_API_KEY}&language=en&overview=full"
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=15, http2=False) as client:
         r = await client.get(url)
         data = r.json()
         if data.get("status") == "OK":
