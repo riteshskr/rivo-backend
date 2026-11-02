@@ -2,10 +2,15 @@ fastapi==0.115.6
 uvicorn
 python-dotenv==1.0.1
 supabase==2.22.0
-httpx==0.28.1
 websockets==13.1
 python-multipart==0.0.20
 pyjwt==2.10.1
 firebase-admin==6.6.0
 deep-translator==1.11.4
 h2==4.1.0
+supabase-auth==2.12.3
+postgrest==1.1.1
+storage3==0.12.1
+realtime==2.7.0
+supabase-functions==0.10.1
+httpx<0.29
