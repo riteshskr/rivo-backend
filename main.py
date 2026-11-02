@@ -1162,27 +1162,42 @@ async def update_driver_location(driver_id: str, payload: DriverLocationRequest)
 def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None), driver_lat: float = Query(None), driver_lng: float = Query(None)):
     if not driver_id:
         raise HTTPException(400, "driver_id required")
-    d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type, status, is_active, is_online").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+    
+    # 🔥 FIX: d_res को पहले None कर दिया ताकि UnboundLocalError न आए
+    d_res = None
+    try:
+        d_res = supabase.table("drivers").select("current_latitude, current_longitude, vehicle_type, status, is_active, is_online").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+    except Exception as e:
+        print(f"Driver fetch error: {e}")
+        raise HTTPException(500, "Database error")
 
-    if not d_res.data:
+    if not d_res or not d_res.data:
         raise HTTPException(404, "Driver not found")
+    
     drv = d_res.data[0]
     drv_status = str(drv.get("status") or "").lower().strip()
     if drv_status not in ["", "null", "none", "ok", "available", "free"]:
         return []  # driver busy है तो कोई ride मत दिखाओ
+    
     if drv.get("is_active") == False or drv.get("is_online") == False:
         return []
+    
     d_lat = driver_lat if driver_lat is not None else drv.get("current_latitude")
     d_lng = driver_lng if driver_lng is not None else drv.get("current_longitude")
     d_vehicle = (vehicle_type or drv.get("vehicle_type") or "").strip()
+    
     # अब Vehicle Table से Range
     driver_range = get_range_from_vehicle_table(d_vehicle)
+    
     q = supabase.table("rides").select("*").in_("status",["pending","searching"]).order("id", desc=True).limit(50)
     if d_vehicle:
         q = q.eq("vehicle_type", d_vehicle)
+    
     rides = q.execute().data or []
+    
     if d_lat is None or d_lng is None:
         return []
+    
     filtered = []
     for ride in rides:
         try:
@@ -1197,8 +1212,10 @@ def pending_rides(vehicle_type: str = Query(None), driver_id: str = Query(None),
                 filtered.append(ride)
         except:
             continue
+    
     filtered.sort(key=lambda x: x.get("distance_from_driver", 999))
     return filtered
+
 
 
 
