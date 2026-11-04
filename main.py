@@ -48,7 +48,7 @@ STRINGEE_API_KEY_SID = os.getenv("STRINGEE_API_KEY_SID")
 STRINGEE_API_KEY_SECRET = os.getenv("STRINGEE_API_KEY_SECRET")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "rivo_jaipur_2026_default")
-OTHER_SERVER_URL = os.getenv("OTHER_SERVER_URL")
+
 
 try:
     fj = os.getenv("FIREBASE_CREDENTIALS_JSON")
@@ -674,42 +674,10 @@ async def auto_timeout_checker():
             is_timeout_running = False  # Lock खोलना बहुत जरूरी
         await asyncio.sleep(60)  # FIX 4: 30 से बढ़ाकर 60 सेकंड कर दिया
 
-async def keep_other_awake():
-    if not OTHER_SERVER_URL:
-        print("OTHER_SERVER_URL not set")
-        return
-    await asyncio.sleep(15)
-    while True:
-        try:
-            async with httpx.AsyncClient(timeout=25) as client:
-                base = OTHER_SERVER_URL.rstrip('/')
-                # 3 URLs try करो, कोई एक तो जगाएगा
-                urls = [f"{base}/health", f"{base}/", f"{base}/health?t={int(time.time())}"]
-                for url in urls:
-                    try:
-                        r = await client.get(url)
-                        print(f"✅ Ping {url} -> {r.status_code}")
-                        if r.status_code == 200:
-                            break
-                        if r.status_code == 502:
-                            print("Other sleeping, retry in 20s...")
-                            await asyncio.sleep(20)
-                            r2 = await client.get(url)
-                            print(f"✅ Retry -> {r2.status_code}")
-                            if r2.status_code == 200:
-                                break
-                    except Exception as inner_e:
-                        print(f"Ping try fail {url}: {inner_e}")
-                        continue
-        except Exception as e:
-            print(f"❌ Ping fail {e}")
-        await asyncio.sleep(60)
-
-
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(auto_timeout_checker())
- # asyncio.create_task(keep_other_awake())
+ 
     
     # 🔥 NAYA: स्टार्टअप पर Tunnel URL सिंक करने की कोशिश करें
   #asyncio.create_task(sync_tunnel_on_startup())
