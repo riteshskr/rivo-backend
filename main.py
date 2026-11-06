@@ -752,20 +752,25 @@ def get_advance_rides(user_id: str):
         print(f"advance rides error {e}")
         return {"rides": [], "count": 0}
 @app.put("/drivers/{driver_id}/offline")
-def set_driver_offline(driver_id: str):
+async def set_driver_offline(driver_id: str):
     try:
-        # 1. DB में offline करो
         supabase.table("drivers").update({
             "is_online": False, 
             "last_seen": datetime.now(timezone.utc).isoformat()
         }).or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").execute()
-        # 2. Memory से भी निकालो
+        for d in list(manager.driver_connections):
+            if d.get("driver_id") == driver_id:
+                try:
+                    await d["ws"].close()
+                except:
+                    pass
         manager.driver_connections = [d for d in manager.driver_connections if d.get("driver_id") != driver_id]
-        print(f"Driver {driver_id} OFFLINE - memory se nikala")
         return {"success": True}
     except Exception as e:
         print(f"offline error {e}")
         return {"success": False}
+
+
 
 
 @app.put("/rides/{ride_id}/offer")
@@ -1066,31 +1071,36 @@ async def driver_login(payload: DriverLoginRequest):
     password_input = str(payload.password or "").strip()
     if not driver_input:
         raise HTTPException(400, "Phone/ID required")
-    driver = None
-    for field in ["id", "driver_id", "phone"]:
-        # 🔥 यहाँ ब्रैकेट सही किया गया है
-        res = await asyncio.to_thread(
-            lambda f=field: supabase.table("drivers").select("*").eq(f, driver_input).limit(1).execute()
-        )
-        if res.data:
-            driver = res.data[0]
-            break
-            
-    if not driver:
-        raise HTTPException(404, f"Driver not found: {driver_input}")
+    print(f"LOGIN TRY: {driver_input}")
+    try:
+        # 🔥 3 Query की जगह सिर्फ 1 Query - or_ से तीनों में एक साथ ढूंढो
+        res = supabase.table("drivers").select("*").or_(
+            f"id.eq.{driver_input},driver_id.eq.{driver_input},phone.eq.{driver_input}"
+        ).limit(1).execute()
+        if not res.data:
+            print(f"LOGIN FAIL: Driver not found {driver_input}")
+            raise HTTPException(404, f"Driver not found: {driver_input}")
+        driver = res.data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"LOGIN DB ERROR: {e}")
+        raise HTTPException(503, "Server Busy - Thodi der baad try karo")
     if str(driver.get('password','')).strip() != password_input:
         raise HTTPException(401, "Wrong password")
-        
-    # 🔥 FCM टोकन अपडेट करने का कोड (यह सही है)
+    # FCM Token update - इसको Background में करो, Login को मत रोको
     if payload.fcm_token:
         try:
-            await asyncio.to_thread(
-                lambda: supabase.table("drivers").update({"fcm_token": payload.fcm_token}).eq("id", driver['id']).execute()
-            )
+            supabase.table("drivers").update({
+                "fcm_token": payload.fcm_token,
+                "is_online": True
+            }).eq("id", driver['id']).execute()
         except Exception as e:
             print(f"FCM update error: {e}")
-            
+    print(f"LOGIN SUCCESS: {driver['id']}")
     return driver
+
+
 
 
 @app.get("/maps/directions")
@@ -1541,7 +1551,6 @@ async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = 
                 row = d_res.data[0]
                 drange = get_range_by_vehicle(row.get("vehicle_type"), row.get("range"))
                 db_vehicle = row.get("vehicle_type","")
-                # अगर query में lat नहीं आया तो DB वाला use करो
                 if lat is None:
                     lat = row.get("current_latitude")
                 if lng is None:
@@ -1553,22 +1562,24 @@ async def ws_drivers(ws: WebSocket, vehicle_type: str = Query(""), lat: float = 
     await manager.connect_driver(ws, vehicle_type, lat, lng, drange, driver_id)
     try:
         while True:
+            data = await ws.receive_text()
             try:
-                data = await ws.receive_text()
-                # Driver app हर 10 sec location भेजता है -> {"type":"location_update","lat":..,"lng":..}
                 j = json.loads(data)
                 if j.get("type") == "location_update":
                     nlat = j.get("lat") or j.get("latitude")
                     nlng = j.get("lng") or j.get("longitude")
                     if nlat and nlng:
                         manager.update_driver_location(driver_id, float(nlat), float(nlng))
-            except json.JSONDecodeError:
-                # plain text ignore
-                pass
             except:
                 pass
     except WebSocketDisconnect:
+        print(f"WS Disconnect: {driver_id}")
         manager.disconnect_driver(ws)
+    except Exception as e:
+        print(f"WS Error {driver_id}: {e}")
+        manager.disconnect_driver(ws)
+
+
 
 
 
