@@ -21,26 +21,16 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False,
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
-import httpx
+
 from supabase import create_client, Client
 from supabase.lib.client_options import ClientOptions  # 🔥 यह इम्पोर्ट जरूरी है
 
-# HTTP/1.1 वाला क्लाइंट बनाएं
-_httpx_client = httpx.Client(
-    http2=False,
-    timeout=httpx.Timeout(30.0, connect=10.0),
-    limits=httpx.Limits(
-        max_keepalive_connections=10,
-        max_connections=40,
-        keepalive_expiry=15.0,
-    ),
-)
 
 # Supabase क्लाइंट को सही तरीके से बनाएं
 supabase: Client = create_client(
     SUPABASE_URL, 
     SUPABASE_KEY,
-    options=ClientOptions(httpx_client=_httpx_client)  # 🔥 ClientOptions का इस्तेमाल करें
+    options=ClientOptions()  # 🔥 ClientOptions का इस्तेमाल करें
 )
 
 
@@ -1067,7 +1057,7 @@ def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
     return {"success": True}
 
 @app.post("/drivers/login")
-def driver_login(payload: DriverLoginRequest):
+async def driver_login(payload: DriverLoginRequest):
     raw_input = payload.phone or payload.mobile or payload.driver_id or payload.username or ""
     driver_input = str(raw_input).strip()
     password_input = str(payload.password or "").strip()
@@ -1075,15 +1065,30 @@ def driver_login(payload: DriverLoginRequest):
         raise HTTPException(400, "Phone/ID required")
     driver = None
     for field in ["id", "driver_id", "phone"]:
-        res = supabase.table("drivers").select("*").eq(field, driver_input).limit(1).execute()
+        # 🔥 यहाँ ब्रैकेट सही किया गया है
+        res = await asyncio.to_thread(
+            lambda f=field: supabase.table("drivers").select("*").eq(f, driver_input).limit(1).execute()
+        )
         if res.data:
             driver = res.data[0]
             break
+            
     if not driver:
         raise HTTPException(404, f"Driver not found: {driver_input}")
     if str(driver.get('password','')).strip() != password_input:
         raise HTTPException(401, "Wrong password")
+        
+    # 🔥 FCM टोकन अपडेट करने का कोड (यह सही है)
+    if payload.fcm_token:
+        try:
+            await asyncio.to_thread(
+                lambda: supabase.table("drivers").update({"fcm_token": payload.fcm_token}).eq("id", driver['id']).execute()
+            )
+        except Exception as e:
+            print(f"FCM update error: {e}")
+            
     return driver
+
 
 @app.get("/maps/directions")
 async def get_directions_secure(origin: str = Query(...), dest: str = Query(...)):
@@ -1237,7 +1242,8 @@ def get_ongoing(user_id: str):
     return enrich_ride_with_driver(res.data[0])
 
 @app.post("/rides")
-async def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, user_id: str = Query(...)):
+def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, user_id: str = Query(...)):
+    print(f"🔥 create_ride START user={user_id}")
     # 1. Stringee टोकन जनरेट करें (राइडर कॉलिंग के लिए)
     token, clean_id = generate_stringee_token(user_id, "new")
 
