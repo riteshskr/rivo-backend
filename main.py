@@ -537,6 +537,53 @@ def send_rider_call_fcm(rider_user_id: str, driver_name: str, driver_id: str, ri
     except Exception as e:
         print(f"❌ Call FCM Error: {e}")
         return False
+def send_driver_call_fcm(driver_id: str, rider_name: str, rider_user_id: str, ride_id: int, driver_stringee_token: str):
+    try:
+        if not firebase_admin._apps:
+            return False
+        driver_token = None
+        try:
+            d_res = supabase.table("drivers").select("fcm_token").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
+            if d_res.data and d_res.data[0].get("fcm_token"):
+                driver_token = d_res.data[0].get("fcm_token")
+        except Exception as e:
+            print(f"Driver token fetch error {e}")
+        if not driver_token:
+            print(f"No FCM token for driver {driver_id}")
+            return False
+        if not driver_stringee_token:
+            print(f"No Stringee token for driver {driver_id}")
+            return False
+        call_id = f"call_{ride_id}_{int(time.time())}"
+        message = messaging.Message(
+            token=driver_token,
+            data={
+                "type": "incoming_call",
+                "call_id": call_id,
+                "rider_name": rider_name or "Rider",
+                "rider_id": str(rider_user_id),
+                "caller_id": str(rider_user_id),
+                "ride_id": str(ride_id),
+                "stringee_token": driver_stringee_token,
+            },
+            android=messaging.AndroidConfig(
+                priority="high",
+                ttl=timedelta(seconds=0),
+            ),
+            apns=messaging.APNSConfig(
+                headers={"apns-priority": "10"},
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(content_available=True)
+                ),
+            ),
+        )
+        response = messaging.send(message)
+        print(f"✅ Driver Call FCM sent to {driver_id}: {response}")
+        return True
+    except Exception as e:
+        print(f"❌ Driver Call FCM Error: {e}")
+        return False
+
 
 
 def archive_and_delete_ride(ride_id: int):
@@ -1847,3 +1894,33 @@ def get_admin_stats():
         }
     except Exception as e:
         return {"error": str(e)}
+
+@app.post("/rides/{ride_id}/notify-driver-call")
+async def notify_driver_for_call(ride_id: int, payload: dict):
+    try:
+        r_res = supabase.table("rides").select("driver_id, driver_stringee_token, user_id").eq("id", ride_id).execute()
+        if not r_res.data:
+            raise HTTPException(404, "Ride not found")
+        ride = r_res.data[0]
+        driver_id = ride.get("driver_id")
+        driver_token = ride.get("driver_stringee_token")
+        rider_user_id = payload.get("rider_user_id") or ride.get("user_id") or ""
+        rider_name = payload.get("rider_name") or "Rider"
+        if not driver_id:
+            return {"success": False, "message": "No driver assigned yet"}
+        success = send_driver_call_fcm(
+            driver_id=str(driver_id),
+            rider_name=rider_name,
+            rider_user_id=str(rider_user_id),
+            ride_id=ride_id,
+            driver_stringee_token=driver_token or "",
+        )
+        if success:
+            await asyncio.sleep(3)
+        return {"success": success}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"notify-driver-call error {e}")
+        return {"success": False, "error": str(e)}
+
