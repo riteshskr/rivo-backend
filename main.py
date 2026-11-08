@@ -618,8 +618,7 @@ def archive_and_delete_ride(ride_id: int):
 
 
 TIMEOUT_MINUTES = 10
-is_timeout_running = False 
-
+is_timeout_running = False
 async def auto_timeout_checker():
     await asyncio.sleep(10)  # Server को पहले उठने दो
     global is_timeout_running
@@ -636,8 +635,8 @@ async def auto_timeout_checker():
             pending_res = await asyncio.to_thread(
                 lambda: supabase.table("rides")
                 .select("id,created_at,scheduled_time,status")
-                .in_("status", ["pending","searching"])
-                .limit(20)  # FIX 2: 100 से घटाकर 20 कर दिया
+                .in_("status", ["pending", "searching"])
+                .limit(20)
                 .execute()
             )
             for r in pending_res.data or []:
@@ -648,16 +647,16 @@ async def auto_timeout_checker():
                 if not scheduled_str or str(scheduled_str).strip() in ["", "null", "None"]:
                     if created_at_str:
                         try:
-                            created_dt = datetime.fromisoformat(str(created_at_str).replace('Z','+00:00'))
+                            created_dt = datetime.fromisoformat(str(created_at_str).replace('Z', '+00:00'))
                             if created_dt.tzinfo is None:
                                 created_dt = created_dt.replace(tzinfo=timezone.utc)
-                            if (now - created_dt).total_seconds()/60 >= TIMEOUT_MINUTES:
+                            if (now - created_dt).total_seconds() / 60 >= TIMEOUT_MINUTES:
                                 should_timeout = True
                         except:
                             pass
                 else:
                     try:
-                        sched_dt = datetime.fromisoformat(str(scheduled_str).replace('Z','+00:00'))
+                        sched_dt = datetime.fromisoformat(str(scheduled_str).replace('Z', '+00:00'))
                         if sched_dt.tzinfo is None:
                             sched_dt = sched_dt.replace(tzinfo=timezone.utc)
                         if now >= sched_dt - timedelta(minutes=TIMEOUT_MINUTES):
@@ -666,53 +665,47 @@ async def auto_timeout_checker():
                         pass
                 if should_timeout:
                     try:
-                        # FIX 3: भारी काम भी Thread में
                         await asyncio.to_thread(
                             lambda rid=ride_id: supabase.table("rides").update({"status": "timeout"}).eq("id", rid).execute()
                         )
                         await asyncio.to_thread(
                             lambda rid=ride_id: supabase.table("driver_offers").delete().eq("ride_id", rid).execute()
                         )
-                        # Archive को Background में भेजो, यहीं wait मत करो
-                        # archive_and_delete_ride(ride_id)  <-- ये लाइन हटाओ
-                        # इसकी जगह सिर्फ status timeout करो, Archive अलग Cron करेगा
                         await manager.broadcast_ride_taken(ride_id)
                         print(f"Timeout Ride {ride_id}")
+                        await asyncio.to_thread(archive_and_delete_ride, ride_id)
                     except Exception as e:
                         print(f"Timeout fail {ride_id}: {e}")
-            # rider_accepted वाला part भी Thread में
+            # 👇 ध्यान दो - ये for लूप के बाहर है, अंदर नहीं
             try:
                 rider_acc_res = await asyncio.to_thread(
                     lambda: supabase.table("rides").select("id,offer_expires_at,driver_id,vehicle_type").eq("status", "rider_accepted").limit(10).execute()
                 )
-                for r in rider_acc_res.data or []:
-                    try:
-                        exp_str = r.get("offer_expires_at")
-                        if not exp_str:
-                            continue
-                        exp_dt = datetime.fromisoformat(str(exp_str).replace('Z','+00:00'))
-                        if exp_dt.tzinfo is None:
-                            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-                        if now >= exp_dt:
-                            print(f"Offer Expired for ride {r['id']}")
-                            await asyncio.to_thread(
-                                lambda rid=r['id']: supabase.table("rides").update({
-                                    "status":"pending", "driver_id": None, "driver_name": None,
-                                    "driver_phone": None, "vehicle_number": None, "offer_expires_at": None
-                                }).eq("id", rid).execute()
-                            )
-                            await asyncio.to_thread(
-                                lambda rid=r['id']: supabase.table("driver_offers").delete().eq("ride_id", rid).execute()
-                            )
-                    except Exception as e:
-                        print(f"rider_accepted error {e}")
+                for r2 in rider_acc_res.data or []:
+                    exp_str = r2.get("offer_expires_at")
+                    if not exp_str:
+                        continue
+                    exp_dt = datetime.fromisoformat(str(exp_str).replace('Z', '+00:00'))
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                    if now >= exp_dt:
+                        print(f"Offer Expired for ride {r2['id']}")
+                        await asyncio.to_thread(
+                            lambda rid=r2['id']: supabase.table("rides").update({
+                                "status": "pending", "driver_id": None, "driver_name": None,
+                                "driver_phone": None, "vehicle_number": None, "offer_expires_at": None
+                            }).eq("id", rid).execute()
+                        )
+                        await asyncio.to_thread(
+                            lambda rid=r2['id']: supabase.table("driver_offers").delete().eq("ride_id", rid).execute()
+                        )
             except Exception as e:
                 print(f"rider_accepted check error {e}")
         except Exception as e:
             print(f"auto_timeout outer error {e}")
         finally:
             is_timeout_running = False  # Lock खोलना बहुत जरूरी
-        await asyncio.sleep(60)  # FIX 4: 30 से बढ़ाकर 60 सेकंड कर दिया
+        await asyncio.sleep(60)
 
 @app.on_event("startup")
 async def startup_event():
