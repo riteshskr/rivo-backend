@@ -585,6 +585,57 @@ def send_driver_call_fcm(driver_id: str, rider_name: str, rider_user_id: str, ri
         return False
 
 
+# 🔥 NEW HELPER: Rider ko WS + FCM dono bhejo - WebSocket-only ka asli fix
+async def notify_rider_ride_update(ride_id: int, ride_final: dict, ws_type: str = "ride_accepted"):
+    # 1. WebSocket - Rider ki khuli hui screen ko turant update karo (1-2 sec)
+    try:
+        await manager.broadcast(ride_id, {
+            "type": ws_type,
+            "status": ride_final.get("status", "accepted"),
+            "ride_id": ride_id,
+            "ride": ride_final,
+            "data": ride_final,
+        })
+        print(f"✅ WS {ws_type} sent to rider for ride {ride_id}")
+    except Exception as e:
+        print(f"WS rider notify error {ride_id}: {e}")
+    # 2. FCM - Agar app background me hai ya WS tut gaya to bhi pata chale
+    try:
+        if not firebase_admin._apps:
+            return
+        rider_token = ride_final.get("fcm_token") or ride_final.get("rider_fcm_token")
+        # Token ride me na ho to users table se lo
+        if not rider_token and ride_final.get("user_id"):
+            try:
+                u_res = supabase.table("users").select("fcm_token").eq("device_id", str(ride_final.get("user_id"))).limit(1).execute()
+                if u_res.data and u_res.data[0].get("fcm_token"):
+                    rider_token = u_res.data[0].get("fcm_token")
+            except:
+                pass
+        if not rider_token:
+            print(f"No FCM token for rider ride {ride_id}")
+            return
+        # Data-only FCM - taaki Flutter ka onMessage isko pakad sake
+        msg = messaging.Message(
+            token=rider_token,
+            data={
+                "type": ws_type,
+                "ride_id": str(ride_id),
+                "status": str(ride_final.get("status", "accepted")),
+                "driver_name": str(ride_final.get("driver_name") or ""),
+                "driver_phone": str(ride_final.get("driver_phone") or ""),
+                "vehicle_number": str(ride_final.get("vehicle_number") or ""),
+                "fare": str(ride_final.get("fare") or ""),
+                "otp": str(ride_final.get("otp") or ""),
+                "ride_json": json.dumps(ride_final, default=str),
+            },
+            android=messaging.AndroidConfig(priority="high"),
+        )
+        messaging.send(msg)
+        print(f"✅ FCM {ws_type} sent to rider ride {ride_id}")
+    except Exception as e:
+        print(f"FCM rider notify error {ride_id}: {e}")
+
 
 def archive_and_delete_ride(ride_id: int):
     try:
@@ -892,6 +943,7 @@ async def rider_accept_offer(ride_id: int, payload: AcceptOfferRequest):
             messaging.send(msg)
     except Exception as e:
         print(f"FCM offer accept error {e}")
+    await notify_rider_ride_update(ride_id, ride_data, ws_type="rider_accepted")
     await manager.broadcast_ride_taken(ride_id)
     return {"success": True, "ride": ride_data, "message": "Driver confirmation का इंतजार है (2 min)"}
 
@@ -958,19 +1010,21 @@ async def driver_final_accept(ride_id: int, driver_id: str = Query(...)):
     try:
         supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
     except Exception as e:
-        print(f"delete offers error {e}")
+       print(f"delete offers error {e}")
     # 6. सब Drivers को बताओ Ride ले ली गई
     await manager.broadcast_ride_taken(ride_id)
     # 7. Final Ride Return करो - OTP Screen के लिए
     ride_final = enrich_ride_with_driver(updated.data[0])
+    # 🔥 FIX: Rider ko WS + FCM bhejo - ab Rider ko "Driver mil gaya" dikhega
+    await notify_rider_ride_update(ride_id, ride_final, ws_type="ride_accepted")
     print(f"✅ Driver {driver_id} Final Accepted Ride {ride_id} -> {ride_final.get('status')}")
     # Flutter App दोनों format समझ ले इसलिए 3 key में भेज रहा हूँ
     return {
-        "success": True, 
-        "ride": ride_final,
-        "data": ride_final,  # Backup
-        "status": "accepted",
-        "message": "Ride Accepted - OTP Screen पर जाओ"
+       "success": True,
+       "ride": ride_final,
+       "data": ride_final,
+       "status": "accepted",
+       "message": "Ride Accepted - OTP Screen पर जाओ"
     }
 
 
@@ -1011,7 +1065,7 @@ class CompleteRideRequest(BaseModel):
     actual_distance: Optional[float] = 0
 
 @app.put("/rides/{ride_id}/complete")
-def complete_ride(ride_id: int, payload: CompleteRideRequest, background_tasks: BackgroundTasks):
+async def complete_ride(ride_id: int, payload: CompleteRideRequest, background_tasks: BackgroundTasks):
     try:
         final_km = payload.total_km_driven or payload.actual_km or payload.actual_distance or 0
         update_data = {
@@ -1022,22 +1076,49 @@ def complete_ride(ride_id: int, payload: CompleteRideRequest, background_tasks: 
         }
         supabase.table("rides").update(update_data).eq("id", ride_id).execute()
         print(f"✅ Ride {ride_id} Completed - total_km_driven: {final_km} KM")
+        # 🔥 FIX: Archive se PEHLE broadcast karo - warna ride delete ke baad Rider ko kuch nahi milega
+        try:
+            ride_res = supabase.table("rides").select("*").eq("id", ride_id).execute()
+            if ride_res.data:
+                ride_final = enrich_ride_with_driver(ride_res.data[0])
+                await notify_rider_ride_update(ride_id, ride_final, ws_type="completed")
+        except Exception as e:
+            print(f"complete broadcast error {ride_id}: {e}")
         background_tasks.add_task(archive_and_delete_ride, ride_id)
         return {"success": True, "total_km_driven": final_km}
     except Exception as e:
         print(f"Complete Error {e}")
         supabase.table("rides").update({"status":"completed", "completed_at": datetime.now(timezone.utc).isoformat()}).eq("id",ride_id).execute()
+        # 🔥 Fail case me bhi broadcast karo
+        try:
+            await manager.broadcast(ride_id, {"type": "completed", "status": "completed", "ride_id": ride_id, "ride": {"id": ride_id, "status": "completed"}})
+        except:
+            pass
         background_tasks.add_task(archive_and_delete_ride, ride_id)
         return {"success": True}
 
+
+    
+
 @app.put("/rides/{ride_id}/drop-complete")
-def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
+async def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
     res = supabase.table("rides").select("*").eq("id", ride_id).execute()
     if not res.data:
         raise HTTPException(404, "Ride नहीं मिली")
     ride = res.data[0]
     gid = group_id or ride.get("pool_group_id")
+    # 🔥 FIX: Update se PEHLE ride ka data save kar lo, taaki broadcast me kaam aaye
+    ride_before = enrich_ride_with_driver(dict(ride))
     supabase.table("rides").update({"status": "completed","passenger_status": "dropped","completed_at": datetime.now(timezone.utc).isoformat(),}).eq("id", ride_id).execute()
+    # 🔥 FIX: Isi passenger ko batao - Tum drop ho gaye, Ride khatam
+    try:
+        ride_before["status"] = "completed"
+        ride_before["passenger_status"] = "dropped"
+        await notify_rider_ride_update(ride_id, ride_before, ws_type="completed")
+        # Extra: Flutter ko saaf-saaf samajh aaye isliye drop wala type bhi bhejo
+        await manager.broadcast(ride_id, {"type": "passenger_dropped", "status": "completed", "ride_id": ride_id, "ride": ride_before})
+    except Exception as e:
+        print(f"drop-complete broadcast error {ride_id}: {e}")
     if background_tasks is not None:
         background_tasks.add_task(archive_and_delete_ride, ride_id)
     else:
@@ -1053,7 +1134,24 @@ def drop_single_pool_ride(ride_id: int, group_id: str = Query(None), driver_id: 
         booked = sum([int(r.get("seats_booked") or 1) for r in remaining_data])
         if remaining_data:
             total = int(remaining_data[0].get("total_seats") or remaining_data[0].get("max_pool_seats") or 4)
+    # 🔥 FIX: Baaki bache hue pool passengers ko bhi batao - 1 seat khali hui
+    if gid:
+        try:
+            remaining_rides = supabase.table("rides").select("id").eq("pool_group_id", gid).in_("status", ["accepted", "started"]).execute().data or []
+            for rr in remaining_rides:
+                await manager.broadcast(int(rr["id"]), {
+                    "type": "pool_seat_freed",
+                    "ride_id": int(rr["id"]),
+                    "booked_seats": booked,
+                    "total_seats": total,
+                    "left_seats": total - booked,
+                    "dropped_ride_id": ride_id
+                })
+        except Exception as e:
+            print(f"pool seat freed broadcast error: {e}")
     return {"success": True,"ride_id": ride_id,"status": "completed","booked_seats": booked,"total_seats": total,"left_seats": total - booked}
+
+
 
 @app.get("/rides/pool/group/{group_id}/driver/{driver_id}")
 def get_my_pooled_rides(group_id: str, driver_id: str):
@@ -1082,27 +1180,55 @@ def get_my_pooled_rides(group_id: str, driver_id: str):
     return {"rides": active,"booked_seats": booked,"total_seats": total,"left_seats": total - booked,"farthest_drop": farthest,"active_count": len(active),"total_count": len(active)}
 
 @app.put("/rides/{ride_id}/cancel")
-def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
+async def cancel_ride(ride_id: int, background_tasks: BackgroundTasks, user_id: str = Query(None)):
+    # 🔥 Cancel se PEHLE ride ka data le lo, taaki FCM ke liye token mile
+    ride_before = None
+    try:
+        r = supabase.table("rides").select("*").eq("id", ride_id).execute()
+        if r.data:
+            ride_before = enrich_ride_with_driver(r.data[0])
+    except:
+        pass
     supabase.table("rides").update({"status": "cancelled"}).eq("id", ride_id).execute()
     try:
         supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
     except:
         pass
+    # 🔥 FIX: Rider ko cancelled bhejo + saare Drivers ko ride_taken bhejo
+    try:
+        if ride_before:
+            ride_before["status"] = "cancelled"
+            await notify_rider_ride_update(ride_id, ride_before, ws_type="cancelled")
+        else:
+            await manager.broadcast(ride_id, {"type": "cancelled", "status": "cancelled", "ride_id": ride_id})
+        await manager.broadcast_ride_taken(ride_id)
+    except Exception as e:
+        print(f"cancel broadcast error {ride_id}: {e}")
     try:
         background_tasks.add_task(archive_and_delete_ride, ride_id)
     except:
         pass
     return {"success": True}
 
+
+
 @app.put("/rides/{ride_id}/timeout")
-def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
+async def timeout_ride(ride_id: int, background_tasks: BackgroundTasks):
     supabase.table("rides").update({"status":"timeout"}).eq("id", ride_id).execute()
     try:
         supabase.table("driver_offers").delete().eq("ride_id", ride_id).execute()
     except:
         pass
+    # 🔥 FIX
+    try:
+        await manager.broadcast(ride_id, {"type": "timeout", "status": "timeout", "ride_id": ride_id})
+        await manager.broadcast_ride_taken(ride_id)
+    except:
+        pass
     background_tasks.add_task(archive_and_delete_ride, ride_id)
     return {"success": True}
+
+
 
 @app.post("/drivers/login")
 async def driver_login(payload: DriverLoginRequest):
@@ -1457,10 +1583,12 @@ async def accept_ride(ride_id: int, driver_id: str=Query(...)):
         pass
     await manager.broadcast_ride_taken(ride_id)
     final_ride = enrich_ride_with_driver(updated.data[0])
+    # 🔥 FIX: Rider ko WS + FCM bhejo - warna Rider ko pata hi nahi chalega
+    await notify_rider_ride_update(ride_id, final_ride, ws_type="ride_accepted")
     return {"success":True, "ride":final_ride}
 
 @app.put("/rides/{ride_id}/accept-pool")
-def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id: str = Query(...)):
+async def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id: str = Query(...)):
     d_res = supabase.table("drivers").select("id,name,phone,vehicle_number,vehicle_type,photo_url").or_(f"id.eq.{driver_id},driver_id.eq.{driver_id}").limit(1).execute()
     if not d_res.data:
         raise HTTPException(404, "Driver not found")
@@ -1489,6 +1617,8 @@ def accept_pool_along_route(ride_id: int, driver_id: str = Query(...), group_id:
     except:
         pass
     final_ride = enrich_ride_with_driver(res.data[0])
+    # 🔥 FIX: Pool Rider ko bhi WS + FCM
+    await notify_rider_ride_update(ride_id, final_ride, ws_type="ride_accepted")
     return {"success": True, "ride": final_ride, "booked": booked + int(res.data[0].get("seats_booked") or 1), "total": max_seats}
 
 @app.get("/rides/pool/along-route/{active_ride_id}")
@@ -1560,14 +1690,24 @@ def get_pool_rides_along_route(active_ride_id: int, driver_id: str = Query(...),
     return along[:8]
 
 @app.post("/rides/{ride_id}/verify-otp")
-def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
+async def verify_ride_otp(ride_id: int, payload: OtpVerifyRequest):
     res = supabase.table("rides").select("id,otp,status").eq("id", ride_id).execute()
     if not res.data:
         raise HTTPException(404, "Ride not found")
     if str(res.data[0].get("otp","")).strip()!= str(payload.otp).strip():
         raise HTTPException(400, "Galat OTP")
     supabase.table("rides").update({"status": "started","started_at": datetime.now(timezone.utc).isoformat(), "passenger_status": "onboard"}).eq("id", ride_id).execute()
+    # 🔥 FIX: Rider ko batao Ride START ho gayi
+    try:
+        ride_res = supabase.table("rides").select("*").eq("id", ride_id).execute()
+        if ride_res.data:
+            ride_final = enrich_ride_with_driver(ride_res.data[0])
+            await notify_rider_ride_update(ride_id, ride_final, ws_type="started")
+    except Exception as e:
+        print(f"verify-otp broadcast error {ride_id}: {e}")
     return {"success": True}
+
+
 
 @app.get("/drivers/{driver_id}/active-ride")
 def get_active_ride(driver_id: str):
@@ -1662,21 +1802,6 @@ def get_driver_location_for_ride(ride_id: int):
         print(f"driver-location error {e}")
         raise HTTPException(500, str(e))
 
-@app.put("/rides/pool/group/{group_id}/complete")
-def complete_pool_group(group_id: str, driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
-    try:
-        res = supabase.table("rides").select("id").eq("pool_group_id", group_id).in_("status", ["accepted","started","arrived","pending","searching"]).execute()
-        rides = res.data or []
-        if not rides:
-            return {"success": True, "message": "Already completed"}
-        for r in rides:
-            supabase.table("rides").update({"status": "completed","passenger_status": "dropped","completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", r["id"]).execute()
-            if background_tasks:
-                background_tasks.add_task(archive_and_delete_ride, r["id"])
-        return {"success": True, "completed_count": len(rides), "group_id": group_id}
-    except Exception as e:
-        print(f"Group Complete Error {e}")
-        raise HTTPException(500, str(e))
 
 @app.get("/rides/{ride_id}/with-driver-location")
 def get_ride_with_driver_location(ride_id: int):
@@ -1699,6 +1824,31 @@ def get_ride_with_driver_location(ride_id: int):
         except:
             pass
     return ride
+
+@app.get("/rides/pool/group/{group_id}/complete")
+async def complete_pool_group(group_id: str, driver_id: str = Query(None), background_tasks: BackgroundTasks = None):
+    try:
+        res = supabase.table("rides").select("*").eq("pool_group_id", group_id).in_("status", ["accepted","started","arrived","pending","searching"]).execute()
+        rides = res.data or []
+        if not rides:
+            return {"success": True, "message": "Already completed"}
+        for r in rides:
+            rid = int(r["id"])
+            # 🔥 FIX: Har rider ko alag-alag uske ride_id par broadcast karo
+            try:
+                ride_final = enrich_ride_with_driver(dict(r))
+                ride_final["status"] = "completed"
+                await notify_rider_ride_update(rid, ride_final, ws_type="completed")
+            except Exception as e:
+                print(f"group complete broadcast error {rid}: {e}")
+            supabase.table("rides").update({"status": "completed","passenger_status": "dropped","completed_at": datetime.now(timezone.utc).isoformat()}).eq("id", rid).execute()
+            if background_tasks:
+                background_tasks.add_task(archive_and_delete_ride, rid)
+        return {"success": True, "completed_count": len(rides), "group_id": group_id}
+    except Exception as e:
+        print(f"Group Complete Error {e}")
+        raise HTTPException(500, str(e))
+
 
 @app.get("/admin/drivers")
 def get_all_drivers_admin():
