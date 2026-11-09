@@ -31,8 +31,8 @@ supabase: Client = create_client(
     SUPABASE_URL, 
     SUPABASE_KEY,
     options=ClientOptions(  # 🔥 ClientOptions का इस्तेमाल करें
-    postgrest_client_timeout=10,  # 10 सेकंड में टाइमआउट
-    storage_client_timeout=10,
+    postgrest_client_timeout=30,  # 10 सेकंड में टाइमआउट
+    storage_client_timeout=30,
  )
 )
 
