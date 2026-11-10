@@ -385,7 +385,9 @@ def send_fcm_global(ride_data: dict, vehicle_type: str = ""):
             title = f"POOL {vehicle_type}!{seats_info}"
         else:
             title = f"RIDE {vehicle_type}!"
-        body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | ₹{ride_data.get('fare','')}"
+        cur = ride_data.get('currency') or ride_data.get('currency_symbol') or '₹'
+        body = f"[{trip.upper()}{seats_info}] {ride_data.get('pickup_address','')[:40]} -> {ride_data.get('drop_address','')[:25]} | {cur}{ride_data.get('fare','')}"
+
 
         android_notif = messaging.AndroidNotification(
             channel_id='ride_channel_v6_final',
@@ -442,6 +444,9 @@ class RideCreateRequest(BaseModel):
     rider_phone: Optional[str] = None
     rider_id: Optional[str] = None
     device_id: Optional[str] = None
+    country: Optional[str] = None
+    country_code: Optional[str] = None
+      
 
 class DriverLoginRequest(BaseModel):
     driver_id: Optional[str]=None
@@ -1422,11 +1427,8 @@ def get_ongoing(user_id: str):
 
 @app.post("/rides")
 def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, user_id: str = Query(...)):
-    print(f"🔥 create_ride START user={user_id}")
-    # 1. Stringee टोकन जनरेट करें (राइडर कॉलिंग के लिए)
+    print(f"🔥 create_ride START user={user_id} country={payload.country_code} fare={payload.fare}")
     token, clean_id = generate_stringee_token(user_id, "new")
-
-    # 2. यात्रा प्रकार का सामान्यीकरण
     raw_type = payload.trip_type.lower()
     if "pool_parcel" in raw_type or "pool parcel" in raw_type:
         final_trip = "pool_parcel"
@@ -1436,39 +1438,35 @@ def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, u
         final_trip = "pool"
     else:
         final_trip = "ride"
-
-    # 3. वाहन जानकारी प्राप्त करें
-    v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).limit(1).execute()
+    # --- 1. COUNTRY + CURRENCY countries टेबल से ---
+    country_code = (payload.country_code or "IN").upper()
+    country_name = payload.country or "India"
+    currency_symbol = "₹"
+    currency_code = "INR"
+    try:
+        c_res = supabase.table("countries").select("*").eq("code", country_code).limit(1).execute()
+        if c_res.data:
+            country_name = c_res.data[0].get("name") or country_name
+            currency_symbol = c_res.data[0].get("currency_symbol") or currency_symbol
+            currency_code = c_res.data[0].get("currency_code") or currency_code
+    except Exception as e:
+        print(f"country fetch error {e}")
+    # --- 2. VEHICLE - नाम + country_code दोनों से ---
+    v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).eq("country_code", country_code).limit(1).execute()
     if not v_res.data:
-        v_res = supabase.table("vehicles").select("*").limit(1).execute()
+        v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).ilike("country_code", country_code).limit(1).execute()
+    if not v_res.data:
+        v_res = supabase.table("vehicles").select("*").ilike("name", payload.vehicle_type).limit(1).execute()
     vehicle_row = v_res.data[0] if v_res.data else {}
-
-    def to_bool(v):
-        if v is True or v == 1:
-            return True
-        if isinstance(v, str) and v.lower() == 'true':
-            return True
-        return False
-
-    has_offer = to_bool(vehicle_row.get("has_offer"))
-    has_offer_pool = to_bool(vehicle_row.get("has_offer_pool"))
-    final_status = "pending"
-    print(f"RIDE CREATE: {payload.vehicle_type} trip={final_trip} -> status={final_status}")
-
-    # 4. किराया गणना
-    correct_fare, slot, rate = calculate_fare_by_type(vehicle_row, payload.distance, final_trip, payload.scheduled_time)
-
-    # 5. सीट लॉजिक
+    # --- 3. FARE - राइडर ऐप से आया हुआ, बैकएंड दोबारा कैलकुलेट नहीं करेगा ---
+    correct_fare = float(payload.fare or 0)
     max_seats = int(vehicle_row.get("max_pool_seats") or 3)
     seats_needed = int(payload.seats or 1)
     if seats_needed < 1:
         seats_needed = 1
     if seats_needed > max_seats:
         seats_needed = max_seats
-
     pool_group_id = f"POOL_{uuid.uuid4().hex[:6].upper()}" if final_trip == "pool" else None
-
-    # 6. पूल ग्रुप लॉजिक (यदि पूल है, तो समान दिशा वाले ग्रुप में शामिल होने का प्रयास करें)
     if final_trip == "pool":
         try:
             active_pools = supabase.table("rides").select("pool_group_id, pickup_lat, pickup_lng, drop_lat, drop_lng").eq("trip_type", "pool").in_("status", ["pending", "accepted", "started", "searching"]).eq("vehicle_type", payload.vehicle_type).limit(30).execute().data or []
@@ -1493,14 +1491,8 @@ def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, u
                 pool_group_id = found_group
         except Exception as e:
             print(f"Pool seat check error {e}")
-        correct_fare = correct_fare * seats_needed
-
-    # 7. 🔥 हिंदी अनुवाद हटा दिया गया है (सर्वर स्लो होने का मुख्य कारण)
-    # अगर हिंदी एड्रेस चाहिए तो ऐप से ही भेजें, या बैकग्राउंड में करें।
     final_pickup_hi = payload.pickup_address_hi or payload.pickup_address
     final_drop_hi = payload.drop_address_hi or payload.drop_address
-
-    # 8. राइड डेटा बनाएं
     ride_data = {
         "user_id": user_id,
         "pickup_lat": payload.pickup_lat,
@@ -1515,9 +1507,14 @@ def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, u
         "distance": payload.distance,
         "fare": correct_fare,
         "trip_type": final_trip,
-        "status": final_status,
+        "status": "pending",
         "otp": payload.otp,
-        "currency": "INR",
+        "currency": currency_symbol,
+        "currency_symbol": currency_symbol,
+        "currency_code": currency_code,
+        "fare_currency": currency_code,
+        "country": country_name,
+        "country_code": country_code,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "scheduled_time": payload.scheduled_time,
         "stringee_token": token,
@@ -1533,26 +1530,26 @@ def create_ride(payload: RideCreateRequest, background_tasks: BackgroundTasks, u
         "fcm_token": payload.fcm_token or payload.rider_fcm_token,
         "rider_fcm_token": payload.rider_fcm_token or payload.fcm_token,
     }
-
-    # 9. डेटाबेस में डालें
-    try:
-        res = supabase.table("rides").insert(ride_data).execute()
-        if not res.data:
-            raise HTTPException(500, "Failed to create ride in DB")
-    except Exception as db_err:
-        print(f"❌ DB Insert Error: {db_err}")
-        raise HTTPException(500, f"Database Error: {str(db_err)}")
-
+    # Retry - Server disconnected वाले 500 से बचने के लिए
+    res = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            res = supabase.table("rides").insert(ride_data).execute()
+            break
+        except Exception as db_err:
+            last_err = db_err
+            print(f"❌ DB Insert Retry {attempt+1}: {db_err}")
+            time.sleep(1)
+    if not res or not res.data:
+        raise HTTPException(500, f"Database Error: {str(last_err)}")
     new_ride = res.data[0]
-
-    # 10. 🔥 सबसे बड़ा बदलाव: ब्रॉडकास्ट और FCM को बैकग्राउंड में भेजें 
-    # (इससे API तुरंत रिस्पॉन्स देगा और टाइमआउट नहीं होगा)
     background_tasks.add_task(manager.broadcast_new_ride, new_ride)
     background_tasks.add_task(send_fcm_global, new_ride, payload.vehicle_type)
-
-    # 11. तुरंत रिस्पॉन्स दें
-    print(f"✅ Ride Created Successfully ID: {new_ride.get('id')}")
+    print(f"✅ Ride Created ID: {new_ride.get('id')} {country_name} {currency_symbol}{correct_fare}")
     return new_ride
+
+
 
 
 

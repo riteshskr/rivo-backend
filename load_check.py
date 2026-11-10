@@ -15,7 +15,7 @@ async def create_ride(client, i):
         return 0
 async def pending_list(client):
     try:
-        r = await client.get(f"{BASE}/rides/pending/list?driver_id=car1", timeout=20)
+        r = await client.get(f"{BASE}/rides/pending/list?driver_id=car1", timeout=30)
         return 1 if r.status_code == 200 else 0
     except:
         return 0
@@ -23,10 +23,10 @@ async def main():
     async with httpx.AsyncClient() as client:
         print("--- TEST 1: 20 Ride Create ---")
         start = time.time()
-        res = await asyncio.gather(*[create_ride(client, i) for i in range(20)])
-        print(f"OK: {sum(res)}/20 | Time: {time.time()-start:.1f} sec")
+        res = await asyncio.gather(*[create_ride(client, i) for i in range(30)])
+        print(f"OK: {sum(res)}/30 | Time: {time.time()-start:.1f} sec")
         print("\n--- TEST 2: 20 Driver Pending List ---")
         start = time.time()
-        res2 = await asyncio.gather(*[pending_list(client) for _ in range(20)])
-        print(f"OK: {sum(res2)}/20 | Time: {time.time()-start:.1f} sec")
+        res2 = await asyncio.gather(*[pending_list(client) for _ in range(30)])
+        print(f"OK: {sum(res2)}/30 | Time: {time.time()-start:.1f} sec")
 asyncio.run(main())

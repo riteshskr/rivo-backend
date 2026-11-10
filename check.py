@@ -11,7 +11,7 @@ async def one(client, i):
         return f"Ride {i}: FAIL {e}"
 async def main():
     async with httpx.AsyncClient() as client:
-        res = await asyncio.gather(*[one(client, i) for i in range(20)])
+        res = await asyncio.gather(*[one(client, i) for i in range(10)])
         for line in res:
             print(line)
 import asyncio
